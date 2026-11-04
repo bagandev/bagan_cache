@@ -1,0 +1,24 @@
+[package]
+name = "bagan_cache"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+napi = { version = "3", features = ["serde-json"], optional = true }
+napi-derive = { version = "3", optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+peisar = "2.0.1"
+
+[build-dependencies]
+napi-build = "2"
+
+
+[lib]
+name = "bagan_cache"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+npm = ["dep:napi", "dep:napi-derive", "peisar/npm"]
