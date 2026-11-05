@@ -1,3 +1,0 @@
-# `@bagandev/bagan_cache-win32-arm64-msvc`
-
-This is the **aarch64-pc-windows-msvc** binary for `@bagandev/bagan_cache`
