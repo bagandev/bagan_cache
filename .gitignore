@@ -1,1 +1,10 @@
 /target
+/contents
+/public
+index.md
+/bagan_themes
+.bagan_cache
+.bagan
+.bagan-cache
+.peisar-cache
+.peisar
