@@ -19,7 +19,6 @@ jobs:
   # ── Native builds for every supported platform ─────────────────────────
   build:
     if: github.event_name == 'release'
-    needs: [test]
     strategy:
       fail-fast: false
       matrix:
