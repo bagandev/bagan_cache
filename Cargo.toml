@@ -2,6 +2,7 @@
 name = "bagan_cache"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
 napi = { version = "3", features = ["serde-json"], optional = true }
@@ -25,7 +26,7 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = []
-npm = ["dep:napi", "dep:napi-derive", "peisar/npm"]
+npm = ["dep:napi", "dep:napi-derive", "peisar/npm", "peisar_yaml/npm"]
 
 [[example]]
 name = "cache"
