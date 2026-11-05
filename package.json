@@ -1,0 +1,38 @@
+{
+  "name": "@bagandev/bagan_cache",
+  "version": "0.1.0",
+  "gitHead": "9049b8b7c891c7e15f75575e562e6175500158a7",
+  "description": "Run the filesystem watcher from the project root with:",
+  "keywords": [],
+  "homepage": "https://github.com/bagandev/bagan_cache#readme",
+  "bugs": {
+    "url": "https://github.com/bagandev/bagan_cache/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bagandev/bagan_cache.git"
+  },
+  "files": [
+    "README.md",
+    "index.js",
+    "index.d.ts",
+    "package.json"
+  ],
+  "type": "commonjs",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "build": "bash scripts/build.sh"
+  },
+  "devDependencies": {
+    "@emnapi/core": "^2.0.0-alpha.5",
+    "@emnapi/runtime": "^2.0.0-alpha.5",
+    "@napi-rs/cli": "^3.9.1",
+    "emnapi": "^2.0.0-alpha.5",
+    "oxfmt": "^0.76.0",
+    "oxlint": "^1.91.0"
+  },
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=23.5.0 || ^24.21.0"
+  }
+}

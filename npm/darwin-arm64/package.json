@@ -1,0 +1,27 @@
+{
+  "name": "@bagandev/bagan_cache-darwin-arm64",
+  "version": "0.1.0",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "bagan_cache.darwin-arm64.node",
+  "files": [
+    "bagan_cache.darwin-arm64.node"
+  ],
+  "description": "Run the filesystem watcher from the project root with:",
+  "keywords": [],
+  "homepage": "https://github.com/bagandev/bagan_cache#readme",
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=23.5.0 || ^24.21.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bagandev/bagan_cache.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bagandev/bagan_cache/issues"
+  },
+  "os": [
+    "darwin"
+  ]
+}
