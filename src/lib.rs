@@ -93,19 +93,20 @@ mod def;
 mod file;
 mod lru;
 mod obj_cache;
-
-use def::{
-    DEFAULT_ARCHIVE_DIR_NAME, DEFAULT_BYTE_BUDGET, DEFAULT_FLUSH_INTERVAL_MS, DEFAULT_OUT_DIR,
-    DEFAULT_SHARD_BYTES, DEFAULT_THEME_DIR, DEFAULT_THEME_NAME, THEME_CONFIG_FILE,
-};
+mod theme;
 
 pub use archive::ArchiveHandle;
 pub use base_url::{BaseDirInfo, HostingProvider};
+use def::{
+    DEFAULT_ARCHIVE_DIR_NAME, DEFAULT_BYTE_BUDGET, DEFAULT_FLUSH_INTERVAL_MS, DEFAULT_OUT_DIR,
+    DEFAULT_SHARD_BYTES, NODE_MODULES_DIR,
+};
 pub use lru::LruCache;
 pub use obj_cache::{
     AssetsObject, ObjectCache, PageObject, asset_file_type, asset_out_file, asset_slug,
     extra_frontmatter_fields, file_name_no_ext, markdown_slug, page_out_file,
 };
+use theme::{BaganThemeConfig, ThemeDirs};
 
 use file::{
     ASSET_BINARY_EXTENSIONS, ASSET_EXTENSIONS, MARKDOWN_EXTENSIONS, collect_asset_files,
@@ -272,7 +273,7 @@ pub enum CachedContent {
 /// Cache-wide configuration: directories, markdown options, memory/archive
 /// budgets, hosting/baseUrl resolution, and the build output directory.
 #[cfg_attr(feature = "npm", napi(object))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BaganCacheConfig {
     /// Entry directory holding the markdown files (absolute, or relative
     /// to the current working directory). Defaults to the current directory.
@@ -280,9 +281,30 @@ pub struct BaganCacheConfig {
     /// Optional assets directory, resolved from the current working
     /// directory and required to be inside `entry_dir`.
     pub assets_dir: Option<String>,
-    /// Theme package name resolved from [`DEFAULT_THEME_DIR`] under the current
-    /// working directory. Defaults to [`DEFAULT_THEME_NAME`].
+    /// Theme package name (Jekyll-gem style). When set, the theme is
+    /// resolved from `node_modules/<theme>` and its default export is
+    /// read as the theme configuration. When unset, the site is local:
+    /// the theme directories below are resolved from the current working
+    /// directory instead.
     pub theme: Option<String>,
+    /// Local layouts directory (used when `theme` is unset), resolved
+    /// from the current working directory. Defaults to `_layouts`.
+    pub theme_layouts_dir: Option<String>,
+    /// Local includes directory (used when `theme` is unset), resolved
+    /// from the current working directory. Defaults to `_includes`.
+    pub theme_includes_dir: Option<String>,
+    /// Local assets directory (used when `theme` is unset), resolved
+    /// from the current working directory. Defaults to `_assets`.
+    pub theme_assets_dir: Option<String>,
+    /// Local data directory (used when `theme` is unset), resolved from
+    /// the current working directory. Defaults to `_data`.
+    pub theme_data_dir: Option<String>,
+    /// Theme configuration object (`themeConfigObject`). In theme mode
+    /// the napi constructor loads it automatically from the theme
+    /// package's default export; pass it explicitly to skip the
+    /// automatic load (required for pure-Rust consumers, which have no
+    /// JS runtime to evaluate the export). Ignored when `theme` is unset.
+    pub theme_config: Option<BaganThemeConfig>,
     /// Markdown parsing/rendering options applied to every page render
     /// (GFM/Kramdown toggles, `fragment`, title, …). Custom visitors and
     /// parser hooks are registered separately via `usePlugin()`.
@@ -300,63 +322,6 @@ pub struct BaganCacheConfig {
     /// Archive directory, relative to the current working directory
     /// (default `".peisar-cache"`).
     pub cache_dir: Option<String>,
-}
-
-impl Default for BaganCacheConfig {
-    fn default() -> Self {
-        Self {
-            entry_dir: None,
-            assets_dir: None,
-            theme: Some(DEFAULT_THEME_NAME.to_string()),
-            markdown: None,
-            memory: None,
-            archive: None,
-            hosting: None,
-            out_dir: None,
-            cache_dir: None,
-        }
-    }
-}
-
-/// Theme metadata loaded from [`THEME_CONFIG_FILE`].
-#[cfg_attr(feature = "npm", napi(object))]
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct PeisarThemeConfig {
-    /// Theme package name.
-    pub name: String,
-    /// Theme package version.
-    pub version: String,
-    /// Optional theme author.
-    #[serde(default)]
-    pub author: Option<String>,
-    /// Relative path to the theme's HTML layout templates (default `"_layouts"`).
-    #[serde(default = "default_theme_theme_layouts_dir")]
-    pub theme_layouts_dir: String,
-    /// Relative path to the theme's include templates (default `"_includes"`).
-    #[serde(default = "default_theme_includes_dir")]
-    pub includes_dir: String,
-    /// Relative path to the theme's static assets (default `"_assets"`).
-    #[serde(default = "default_theme_assets_dir")]
-    pub assets_dir: String,
-    /// Relative path to the theme's data files (default `"_data"`).
-    #[serde(default = "default_theme_data_dir")]
-    pub data_dir: String,
-}
-
-fn default_theme_theme_layouts_dir() -> String {
-    "_layouts".to_string()
-}
-
-fn default_theme_includes_dir() -> String {
-    "_includes".to_string()
-}
-
-fn default_theme_assets_dir() -> String {
-    "_assets".to_string()
-}
-
-fn default_theme_data_dir() -> String {
-    "_data".to_string()
 }
 
 /// LRU budgets for the memory tier.
@@ -420,6 +385,7 @@ impl ArchiveConfig {
 #[derive(Debug, Clone, Default)]
 pub struct HostingConfig {
     /// Hosting provider (see [`HostingProvider`]).
+    #[cfg_attr(feature = "npm", napi(ts_type = "BaganHostingProvider"))]
     pub provider: Option<HostingProvider>,
     /// GitHub repository name for project pages (`/<repo>/` prefix).
     pub repo: Option<String>,
@@ -496,20 +462,6 @@ impl ChangeCallbacks {
     }
 }
 
-#[cfg_attr(feature = "npm", napi(object))]
-#[derive(Debug, Clone, Default)]
-/// Resolved theme directories, as absolute paths.
-pub struct ThemeDirs {
-    /// Directory containing the theme's HTML layout templates.
-    pub layouts_dir: String,
-    /// Directory containing the theme's static assets.
-    pub assets_dir: String,
-    /// Directory containing the theme's data files.
-    pub data_dir: String,
-    /// Directory containing the theme's HTML includes files.
-    pub includes_dir: String,
-}
-
 /// In-memory + archive-backed cache of the Markdown and asset files under a
 /// directory tree.
 ///
@@ -543,7 +495,7 @@ pub struct BaganCache {
     entry_dir: PathBuf,
     assets_dir: Option<PathBuf>,
     theme_path: PathBuf,
-    theme_config: PeisarThemeConfig,
+    theme_config: BaganThemeConfig,
     theme_assets_dir: PathBuf,
     theme_layouts_dir: PathBuf,
     theme_data_dir: PathBuf,
@@ -763,35 +715,128 @@ fn layout_names(dir: PathBuf) -> HashSet<String> {
     results
 }
 
+/// Load the theme configuration from a theme package's `package.json`
+/// (name/version/author metadata).
+///
+/// This is the fallback for Rust consumers that have no JS runtime to
+/// evaluate the package's default export; the napi constructor loads the
+/// real `themeConfigObject` from the export itself.
+fn theme_config_from_package_json(theme_path: &Path) -> BaganThemeConfig {
+    let mut config = BaganThemeConfig::default();
+    if let Ok(pkg_text) = fs::read_to_string(theme_path.join("package.json"))
+        && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&pkg_text)
+    {
+        if let Some(name) = pkg.get("name").and_then(serde_json::Value::as_str) {
+            config.name = Some(name.to_string());
+        }
+        if let Some(version) = pkg.get("version").and_then(serde_json::Value::as_str) {
+            config.version = Some(version.to_string());
+        }
+        if let Some(author) = pkg.get("author").and_then(|a| match a {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => o
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        }) {
+            config.author = Some(author);
+        }
+    }
+    config
+}
+
+/// Load the `themeConfigObject` a theme package exports as its default
+/// export through the JS runtime (`node_modules/<theme>`).
+///
+/// Runs on the current JS thread — must only be called from a napi
+/// constructor/factory, never from a background thread. Returns `Ok(None)`
+/// when the package cannot be required (pure asset themes without a JS
+/// entry are a supported setup); the require failure is caught inside
+/// the script so no pending JS exception is left on the env.
+#[cfg(feature = "npm")]
+fn load_theme_config_from_module(
+    env: &Env,
+    cwd: &Path,
+    theme_name: &str,
+) -> Result<Option<BaganThemeConfig>> {
+    // Anchor the loader in the project root so `node_modules/<theme>`
+    // resolves exactly like it would for the user's own code. A synthetic
+    // filename (not a real file) keeps `pathToFileURL` happy without
+    // requiring one to exist. `process.getBuiltinModule` is used because
+    // `napi_run_script` has no module scope (no `require`); it exists in
+    // Node ≥ 20.16 / ≥ 22.3, within the supported engine range.
+    let anchor = cwd.join("index.js").to_string_lossy().to_string();
+    let script = format!(
+        "(() => {{ try {{ \
+         const {{ createRequire }} = process.getBuiltinModule('node:module'); \
+         const {{ pathToFileURL }} = process.getBuiltinModule('node:url'); \
+         const req = createRequire(pathToFileURL({anchor}).href); \
+         const mod = req({theme_json}); \
+         return mod && mod.default !== undefined ? mod.default : mod; \
+         }} catch {{ return null; }} }})()",
+        anchor = serde_json::to_string(&anchor).unwrap_or_default(),
+        theme_json = serde_json::to_string(theme_name).unwrap_or_default(),
+    );
+    let theme_default: Option<BaganThemeConfig> = env.run_script(script)?;
+    Ok(theme_default)
+}
+
 #[cfg_attr(feature = "npm", napi)]
 impl BaganCache {
     /// JS: `new BaganCache(entryDir?, assetsDir?, options?)`.
     ///
     /// `options` configures the theme, Markdown parsing (`fragment`, GFM,
     /// …), archive thresholds, hosting resolution, and output directories.
-    /// Register custom visitors and parser hooks afterwards with
-    /// `usePlugin()`.
+    /// In theme mode `options.themeConfig` is the theme package's default
+    /// export (`themeConfigObject`); the caller is expected to `require`
+    /// (or import) the theme package and pass the export through. Register
+    /// custom visitors and parser hooks afterwards with `usePlugin()`.
     #[cfg(feature = "npm")]
     #[napi(constructor)]
     pub fn new(
+        env: Env,
         entry_dir: Option<String>,
         assets_dir: Option<String>,
         options: Option<BaganCacheJsOptions>,
     ) -> Result<Self> {
-        let mut cache = BaganCache::with_config(BaganCacheConfig {
+        let mut config = BaganCacheConfig {
             entry_dir,
             assets_dir,
             theme: options.as_ref().and_then(|o| o.theme.clone()),
+            theme_layouts_dir: options.as_ref().and_then(|o| o.theme_layouts_dir.clone()),
+            theme_includes_dir: options.as_ref().and_then(|o| o.theme_includes_dir.clone()),
+            theme_assets_dir: options.as_ref().and_then(|o| o.theme_assets_dir.clone()),
+            theme_data_dir: options.as_ref().and_then(|o| o.theme_data_dir.clone()),
+            theme_config: options.as_ref().and_then(|o| o.theme_config.clone()),
             markdown: options.as_ref().and_then(|o| o.markdown.clone()),
             archive: options.as_ref().and_then(|o| o.archive),
             hosting: options.as_ref().and_then(|o| o.hosting.clone()),
             out_dir: options.as_ref().and_then(|o| o.out_dir.clone()),
             cache_dir: options.as_ref().and_then(|o| o.cache_dir.clone()),
             memory: None,
-        })
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e}")))?;
-        let _ = &mut cache; // silence unused-assignment lint paths
-        Ok(cache)
+        };
+        if let Some(theme_config) = options.as_ref().and_then(|o| o.theme_config.clone()) {
+            config.theme_config = Some(theme_config);
+        } else if let Some(theme_name) = config
+            .theme
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            // Auto-load the theme package's default export
+            // (`themeConfigObject`) through the JS runtime. The theme
+            // must be installed as `node_modules/<theme>` relative to the
+            // cwd, which is the same place `with_config` resolves it.
+            // Pure asset themes (layouts/templates only, no JS entry)
+            // report `None` here — also a supported setup; the load
+            // then falls back to the package's package.json metadata
+            // inside `with_config`.
+            let cwd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            config.theme_config = load_theme_config_from_module(&env, &cwd, theme_name)?;
+        }
+        BaganCache::with_config(config)
+            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e}")))
     }
 
     /// JS: `BaganCache.withConfigJs(config)` — full configuration form,
@@ -810,51 +855,70 @@ impl BaganCache {
     /// size/interval flush (or explicitly via [`Self::flush`]).
     pub fn with_config(config: BaganCacheConfig) -> io::Result<Self> {
         let cwd = env::current_dir()?;
-        let theme_name = config.theme.as_deref().unwrap_or(DEFAULT_THEME_NAME);
-        let theme_name_path = Path::new(theme_name);
-        if theme_name.is_empty()
-            || theme_name_path.is_absolute()
-            || theme_name_path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )
-            })
-        {
-            let message = format!("invalid theme package name '{theme_name}'");
-            eprintln!("BaganCache configuration error: {message}");
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
-        }
-        let theme_path = cwd.join(DEFAULT_THEME_DIR).join(theme_name_path);
-        if !theme_path.is_dir() {
-            let message = format!(
-                "theme package '{}' does not exist or is not a directory",
-                theme_path.display()
-            );
-            eprintln!("BaganCache configuration error: {message}");
-            return Err(io::Error::new(io::ErrorKind::NotFound, message));
-        }
-        let theme_config_path = theme_path.join(THEME_CONFIG_FILE);
-        let theme_config_text = fs::read_to_string(&theme_config_path).map_err(|error| {
-            let message = format!(
-                "failed to read theme configuration '{}': {error}",
-                theme_config_path.display()
-            );
-            eprintln!("BaganCache configuration error: {message}");
-            io::Error::new(error.kind(), message)
-        })?;
-        let theme_config: PeisarThemeConfig =
-            serde_json::from_str(&theme_config_text).map_err(|error| {
-                let message = format!(
-                    "invalid theme configuration '{}': {error}",
-                    theme_config_path.display()
-                );
-                eprintln!("BaganCache configuration error: {message}");
-                io::Error::new(io::ErrorKind::InvalidData, message)
-            })?;
-        let theme_assets_dir = theme_path.join(&theme_config.assets_dir);
+        // Resolve the theme (Jekyll-gem style):
+        // - `theme` set → `node_modules/<theme>`, configuration from the
+        //   package's default export (`themeConfigObject`).
+        // - `theme` unset → local site; `_layouts`/`_includes`/`_assets`/
+        //   `_data` (or the configured overrides) resolved from the cwd.
+        let theme_name = config
+            .theme
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        let (theme_path, theme_config) = match theme_name {
+            Some(theme_name) => {
+                let theme_name_path = Path::new(theme_name);
+                if theme_name_path.is_absolute()
+                    || theme_name_path.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::ParentDir | std::path::Component::RootDir
+                        )
+                    })
+                {
+                    let message = format!("invalid theme package name '{theme_name}'");
+                    eprintln!("BaganCache configuration error: {message}");
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+                }
+                let theme_path = cwd.join(NODE_MODULES_DIR).join(theme_name_path);
+                if !theme_path.is_dir() {
+                    let message = format!(
+                        "theme package '{}' does not exist or is not a directory",
+                        theme_path.display()
+                    );
+                    eprintln!("BaganCache configuration error: {message}");
+                    return Err(io::Error::new(io::ErrorKind::NotFound, message));
+                }
+                // The `themeConfigObject` the package exports as its
+                // default (loaded by the napi constructor through the
+                // JS runtime), or — for JS-less Rust consumers — the
+                // package.json metadata fallback.
+                let mut theme_config = config
+                    .theme_config
+                    .clone()
+                    .unwrap_or_else(|| theme_config_from_package_json(&theme_path));
+                theme_config
+                    .name
+                    .get_or_insert_with(|| theme_name.to_string());
+                (theme_path, theme_config)
+            }
+            None => {
+                // Local mode: the theme directories live in the project
+                // itself, resolved from the current working directory.
+                let theme_config = BaganThemeConfig {
+                    layouts_dir: config.theme_layouts_dir.clone(),
+                    includes_dir: config.theme_includes_dir.clone(),
+                    assets_dir: config.theme_assets_dir.clone(),
+                    data_dir: config.theme_data_dir.clone(),
+                    ..Default::default()
+                };
+                (cwd.clone(), theme_config)
+            }
+        };
+        let theme_assets_dir = theme_path.join(theme_config.assets_dir_or_default());
+        let theme_layouts_dir = theme_path.join(theme_config.layouts_dir_or_default());
+        let theme_includes_dir = theme_path.join(theme_config.includes_dir_or_default());
+        let theme_data_dir = theme_path.join(theme_config.data_dir_or_default());
         if theme_assets_dir.exists() && !theme_assets_dir.is_dir() {
             let message = format!(
                 "theme assets path '{}' is not a directory",
@@ -926,17 +990,10 @@ impl BaganCache {
             }
             None => None,
         };
-        let theme_data_dir = theme_path.join(&theme_config.data_dir);
-        // Get layouts names
-        let theme_layouts_dir = theme_path.join(&theme_config.theme_layouts_dir);
-        if !theme_layouts_dir.exists() {
-            let message = format!(
-                "layouts dir path '{}' dose not exists",
-                theme_layouts_dir.display()
-            );
-            eprintln!("BaganCache configuration error: {message}");
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
-        } else if !theme_layouts_dir.is_dir() {
+        // Get layouts names. In local mode the layouts directory may not
+        // exist yet — that only means no markdown page matches a layout,
+        // which is a valid (empty) site, not a configuration error.
+        if theme_layouts_dir.exists() && !theme_layouts_dir.is_dir() {
             let message = format!(
                 "layouts dir path '{}' is not a directory",
                 theme_layouts_dir.display()
@@ -944,7 +1001,6 @@ impl BaganCache {
             eprintln!("BaganCache configuration error: {message}");
             return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
         }
-        let theme_includes_dir = theme_path.join(&theme_config.includes_dir);
         let markdown_layouts: HashSet<String> = layout_names(theme_layouts_dir.clone());
 
         // Markdown options for every page render.
@@ -1517,7 +1573,7 @@ impl BaganCache {
 
     /// Parsed theme metadata exposed as an object to Rust and JavaScript.
     #[cfg_attr(feature = "npm", napi)]
-    pub fn theme_config(&self) -> PeisarThemeConfig {
+    pub fn theme_config(&self) -> BaganThemeConfig {
         self.theme_config.clone()
     }
 
@@ -1648,9 +1704,26 @@ impl BaganCache {
 #[cfg(feature = "npm")]
 #[napi(object)]
 pub struct BaganCacheJsOptions {
-    /// Theme package name resolved from [`DEFAULT_THEME_DIR`]; defaults to
-    /// [`DEFAULT_THEME_NAME`].
+    /// Theme package name (Jekyll-gem style), resolved from
+    /// `node_modules/<theme>`. Omit (null/undefined) for a local site:
+    /// the theme directories below are then resolved from the cwd.
     pub theme: Option<String>,
+    /// Local layouts directory (local mode only), relative to the cwd.
+    /// Defaults to `_layouts`.
+    pub theme_layouts_dir: Option<String>,
+    /// Local includes directory (local mode only), relative to the cwd.
+    /// Defaults to `_includes`.
+    pub theme_includes_dir: Option<String>,
+    /// Local theme assets directory (local mode only), relative to the
+    /// cwd. Defaults to `_assets`.
+    pub theme_assets_dir: Option<String>,
+    /// Local data directory (local mode only), relative to the cwd.
+    /// Defaults to `_data`.
+    pub theme_data_dir: Option<String>,
+    /// Theme configuration object (`themeConfigObject`). When omitted
+    /// (and `theme` is set) it is loaded automatically from the theme
+    /// package's default export.
+    pub theme_config: Option<BaganThemeConfig>,
     /// Markdown parsing/rendering options (`fragment`, GFM, …).
     pub markdown: Option<PeisarOptions>,
     /// Disk-archive thresholds (shard size / flush interval).
@@ -1698,22 +1771,12 @@ mod tests {
             fs::remove_dir_all(&tmp)?;
         }
         fs::create_dir_all(&tmp)?;
-        let default_theme = tmp.join(DEFAULT_THEME_DIR).join(DEFAULT_THEME_NAME);
-        fs::create_dir_all(default_theme.join("_assets"))?;
-        fs::create_dir_all(default_theme.join("_layouts"))?;
+        let local_theme = tmp.join("_layouts");
+        fs::create_dir_all(&local_theme)?;
         for layout in ["default", "docs", "blog", "page", "home"] {
-            fs::write(
-                default_theme
-                    .join("_layouts")
-                    .join(format!("{layout}.html")),
-                "",
-            )?;
+            fs::write(local_theme.join(format!("{layout}.html")), "")?;
         }
-        fs::write(default_theme.join("_layouts").join("ignored.txt"), "")?;
-        fs::write(
-            default_theme.join(THEME_CONFIG_FILE),
-            r#"{"name":"peisar-default","version":"1.0.0"}"#,
-        )?;
+        fs::write(local_theme.join("ignored.txt"), "")?;
         let orig = env::current_dir()?;
         Ok((tmp, orig))
     }
@@ -1743,12 +1806,7 @@ mod tests {
         write_md(&tmp, "blog/post.md", "---\nlayout: blog\n---\n# Blog\n");
         write_md(&tmp, "custom.md", "---\nlayout: custom\n---\n# Custom\n");
         write_md(&tmp, "missing-layout.md", "# No layout\n");
-        fs::write(
-            tmp.join(DEFAULT_THEME_DIR)
-                .join(DEFAULT_THEME_NAME)
-                .join("_layouts/custom.html"),
-            "",
-        )?;
+        fs::write(tmp.join("_layouts").join("custom.html"), "")?;
 
         let cache = BaganCache::with_config(BaganCacheConfig {
             ..Default::default()
@@ -1777,6 +1835,86 @@ mod tests {
     }
 
     #[test]
+    fn local_theme_dirs_default_to_cwd() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("localdirs")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: home\n---\n# Home\n",
+        );
+        fs::create_dir_all(tmp.join("_assets/css"))?;
+        fs::write(tmp.join("_assets/css/site.css"), "body {}")?;
+        fs::create_dir_all(tmp.join("_includes"))?;
+        fs::create_dir_all(tmp.join("_data"))?;
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            ..Default::default()
+        })?;
+
+        // No theme configured: the theme dirs resolve from the cwd.
+        assert_eq!(cache.theme_path(), tmp.to_string_lossy().to_string());
+        let dirs = cache.theme_dirs();
+        assert_eq!(dirs.layouts_dir, tmp.join("_layouts").to_string_lossy());
+        assert_eq!(dirs.includes_dir, tmp.join("_includes").to_string_lossy());
+        assert_eq!(dirs.assets_dir, tmp.join("_assets").to_string_lossy());
+        assert_eq!(dirs.data_dir, tmp.join("_data").to_string_lossy());
+        assert_eq!(cache.pages().len(), 1);
+        let assets = cache.assets();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].slug, "/css/site.css");
+        assert_eq!(assets[0].raw, "body {}");
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn local_theme_dirs_can_be_overridden_in_config() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("localdirsconfig")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: main\n---\n# Home\n",
+        );
+        fs::create_dir_all(tmp.join("templates"))?;
+        fs::write(tmp.join("templates/main.html"), "")?;
+        fs::create_dir_all(tmp.join("partial"))?;
+        fs::create_dir_all(tmp.join("static/img"))?;
+        fs::write(tmp.join("static/img/logo.png"), vec![1u8, 2])?;
+        fs::create_dir_all(tmp.join("dataset"))?;
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            theme_layouts_dir: Some("templates".into()),
+            theme_includes_dir: Some("partial".into()),
+            theme_assets_dir: Some("static".into()),
+            theme_data_dir: Some("dataset".into()),
+            ..Default::default()
+        })?;
+
+        let dirs = cache.theme_dirs();
+        assert_eq!(dirs.layouts_dir, tmp.join("templates").to_string_lossy());
+        assert_eq!(dirs.includes_dir, tmp.join("partial").to_string_lossy());
+        assert_eq!(dirs.assets_dir, tmp.join("static").to_string_lossy());
+        assert_eq!(dirs.data_dir, tmp.join("dataset").to_string_lossy());
+        assert!(
+            cache
+                .markdown_layouts()
+                .iter()
+                .any(|layout| layout == "main")
+        );
+        assert_eq!(cache.assets().len(), 1);
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
     fn theme_config_and_assets_are_loaded() -> io::Result<()> {
         let _guard = TEST_CWD_LOCK.lock().unwrap();
         let (tmp, orig) = make_tmp("theme")?;
@@ -1786,30 +1924,50 @@ mod tests {
             "contents/index.md",
             "---\nlayout: home\n---\n# Home\n",
         );
-        let theme_dir = tmp.join(DEFAULT_THEME_DIR).join("custom-theme");
+        let theme_dir = tmp.join("node_modules").join("custom-theme");
         fs::create_dir_all(theme_dir.join("_assets/css"))?;
         fs::create_dir_all(theme_dir.join("_layouts"))?;
+        fs::create_dir_all(theme_dir.join("_includes"))?;
+        fs::create_dir_all(theme_dir.join("_data"))?;
         fs::write(theme_dir.join("_layouts/home.html"), "")?;
         fs::write(
-            theme_dir.join(THEME_CONFIG_FILE),
-            r#"{"name":"custom-theme","version":"2.0.0"}"#,
+            theme_dir.join("package.json"),
+            r#"{"name":"custom-theme","version":"2.0.0","main":"index.js"}"#,
+        )?;
+        fs::write(
+            theme_dir.join("index.js"),
+            "module.exports = { default: { name: 'custom-theme', version: '2.0.0' } };",
         )?;
         fs::write(theme_dir.join("_assets/css/theme.css"), "body {}")?;
 
+        // Rust entry point: pass the themeConfigObject explicitly (no JS
+        // runtime available to evaluate the package's default export).
         let cache = BaganCache::with_config(BaganCacheConfig {
             entry_dir: Some("contents".into()),
             theme: Some("custom-theme".into()),
+            theme_config: Some(BaganThemeConfig {
+                name: Some("custom-theme".into()),
+                version: Some("2.0.0".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         })?;
 
         let config = cache.theme_config();
-        assert_eq!(config.name, "custom-theme");
-        assert_eq!(config.version, "2.0.0");
+        assert_eq!(config.name.as_deref(), Some("custom-theme"));
+        assert_eq!(config.version.as_deref(), Some("2.0.0"));
         assert_eq!(config.author, None);
-        assert_eq!(config.theme_layouts_dir, "_layouts");
-        assert_eq!(config.includes_dir, "_includes");
-        assert_eq!(config.assets_dir, "_assets");
+        assert_eq!(config.layouts_dir, None);
+        assert_eq!(config.includes_dir, None);
+        assert_eq!(config.assets_dir, None);
+        assert_eq!(config.data_dir, None);
         assert_eq!(cache.theme_path(), theme_dir.to_string_lossy());
+        let dirs = cache.theme_dirs();
+        assert_eq!(
+            dirs.layouts_dir,
+            theme_dir.join("_layouts").to_string_lossy()
+        );
+        assert_eq!(dirs.assets_dir, theme_dir.join("_assets").to_string_lossy());
         assert_eq!(cache.pages().len(), 1);
         let assets = cache.assets();
         assert_eq!(assets.len(), 1);
@@ -1821,22 +1979,59 @@ mod tests {
     }
 
     #[test]
+    fn theme_config_without_js_falls_back_to_package_json() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("pkgfallback")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: home\n---\n# Home\n",
+        );
+        let theme_dir = tmp.join("node_modules").join("meta-theme");
+        fs::create_dir_all(theme_dir.join("_layouts"))?;
+        fs::write(theme_dir.join("_layouts/home.html"), "")?;
+        fs::write(
+            theme_dir.join("package.json"),
+            r#"{"name":"meta-theme","version":"3.1.4","author":{"name":"Bagan"}}"#,
+        )?;
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            theme: Some("meta-theme".into()),
+            ..Default::default()
+        })?;
+
+        let config = cache.theme_config();
+        assert_eq!(config.name.as_deref(), Some("meta-theme"));
+        assert_eq!(config.version.as_deref(), Some("3.1.4"));
+        assert_eq!(config.author.as_deref(), Some("Bagan"));
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
     fn configured_layout_directory_drives_discovery() -> io::Result<()> {
         let _guard = TEST_CWD_LOCK.lock().unwrap();
         let (tmp, orig) = make_tmp("customlayoutdir")?;
         env::set_current_dir(&tmp)?;
         write_md(&tmp, "index.md", "---\nlayout: custom\n---\n# Custom\n");
-        let theme_dir = tmp.join(DEFAULT_THEME_DIR).join("custom-theme");
+        let theme_dir = tmp.join("node_modules").join("custom-theme");
         fs::create_dir_all(theme_dir.join("templates"))?;
         fs::write(
-            theme_dir.join(THEME_CONFIG_FILE),
-            r#"{"name":"custom-theme","version":"1.0.0","theme_layouts_dir":"templates"}"#,
+            theme_dir.join("package.json"),
+            r#"{"name":"custom-theme","version":"1.0.0"}"#,
         )?;
         fs::write(theme_dir.join("templates/custom.html"), "")?;
         fs::write(theme_dir.join("templates/ignored.txt"), "")?;
 
         let cache = BaganCache::with_config(BaganCacheConfig {
             theme: Some("custom-theme".into()),
+            theme_config: Some(BaganThemeConfig {
+                layouts_dir: Some("templates".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         })?;
 
@@ -1858,10 +2053,7 @@ mod tests {
         let _guard = TEST_CWD_LOCK.lock().unwrap();
         let (tmp, orig) = make_tmp("emptylayouts")?;
         env::set_current_dir(&tmp)?;
-        let theme_layouts_dir = tmp
-            .join(DEFAULT_THEME_DIR)
-            .join(DEFAULT_THEME_NAME)
-            .join("_layouts");
+        let theme_layouts_dir = tmp.join("_layouts");
         fs::remove_dir_all(&theme_layouts_dir)?;
         fs::create_dir_all(&theme_layouts_dir)?;
         write_md(&tmp, "index.md", "---\nlayout: default\n---\n# Home\n");
@@ -2103,12 +2295,7 @@ mod tests {
             "---\nlayout: docs\n---\n# Intro\n",
         );
         write_md(&tmp, "outside.md", "---\nlayout: custom\n---\n# Outside\n");
-        fs::write(
-            tmp.join(DEFAULT_THEME_DIR)
-                .join(DEFAULT_THEME_NAME)
-                .join("_layouts/custom.html"),
-            "",
-        )?;
+        fs::write(tmp.join("_layouts").join("custom.html"), "")?;
 
         let cache = BaganCache::with_config(BaganCacheConfig {
             entry_dir: Some("contents".into()),

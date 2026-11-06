@@ -28,7 +28,7 @@ use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 
 /// Static site hosting providers with known `baseUrl` behavior.
-#[cfg_attr(feature = "npm", napi(string_enum))]
+#[cfg_attr(feature = "npm", napi(string_enum, skip_typescript))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HostingProvider {
@@ -53,6 +53,7 @@ pub enum HostingProvider {
 #[serde(rename_all = "camelCase")]
 pub struct BaseDirInfo {
     /// Hosting provider in effect.
+    #[cfg_attr(feature = "npm", napi(ts_type = "BaganHostingProvider"))]
     pub provider: HostingProvider,
     /// Repository name (GitHub Pages project sites): `/<repo>/` prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1,6 +1,6 @@
 {
   "name": "@bagandev/bagan_cache",
-  "version": "0.1.2",
+  "version": "0.1.21",
   "gitHead": "9049b8b7c891c7e15f75575e562e6175500158a7",
   "description": "Run the filesystem watcher from the project root with:",
   "keywords": [],
@@ -14,13 +14,27 @@
   },
   "files": [
     "README.md",
-    "index.js",
+    "index.cjs",
     "index.d.ts",
-    "package.json"
+    "package.json",
+    "index.mjs"
   ],
-  "type": "commonjs",
-  "main": "index.js",
+  "type": "module",
+  "main": "index.cjs",
+  "module": "index.mjs",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "require": {
+        "default": "./index.cjs",
+        "types": "./index.d.ts"
+      },
+      "import": {
+        "default": "./index.mjs",
+        "types": "./index.d.ts"
+      }
+    }
+  },
   "scripts": {
     "build": "bash scripts/build.sh"
   },
