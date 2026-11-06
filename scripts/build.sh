@@ -5,17 +5,6 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 BINARY_FILE="bagan_cache.linux-x64-gnu.node"
-DTS_FILE="types.d.ts"
-
-# 1. Write .d.ts file for napi-rs
-cat << 'EOF' > "$DTS_FILE"
-// Generated from ci.yml
-// napi-rs helper types 
-export type PeisarEmphasisLevel = "Italic" | "Bold";
-export type PeisarTableCellAlignment = "Default" | "Left" | "Center" | "Right";
-export type PeisarTableCellAlignments = PeisarTableCellAlignment[];
-export type PeisarTaskState = "Unchecked" | "Checked";
-EOF
 
 sleep 3
 
@@ -36,8 +25,7 @@ npx oxfmt --write index.d.ts
 
 # 4. Remove binary and .d.ts
 rm -rf "$BINARY_FILE"
-sleep 3
-rm -rf "$DTS_FILE"
+
 
 # 5. Write gitHead
 

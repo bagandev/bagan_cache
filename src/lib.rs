@@ -506,6 +506,8 @@ pub struct ThemeDirs {
     pub assets_dir: String,
     /// Directory containing the theme's data files.
     pub data_dir: String,
+    /// Directory containing the theme's HTML includes files.
+    pub includes_dir: String,
 }
 
 /// In-memory + archive-backed cache of the Markdown and asset files under a
@@ -545,6 +547,7 @@ pub struct BaganCache {
     theme_assets_dir: PathBuf,
     theme_layouts_dir: PathBuf,
     theme_data_dir: PathBuf,
+    theme_includes_dir: PathBuf,
     markdown_layouts: HashSet<String>,
     change_callbacks: ChangeCallbacks,
     /// Hosting/baseUrl configuration.
@@ -941,6 +944,7 @@ impl BaganCache {
             eprintln!("BaganCache configuration error: {message}");
             return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
         }
+        let theme_includes_dir = theme_path.join(&theme_config.includes_dir);
         let markdown_layouts: HashSet<String> = layout_names(theme_layouts_dir.clone());
 
         // Markdown options for every page render.
@@ -1013,6 +1017,7 @@ impl BaganCache {
             theme_assets_dir,
             theme_layouts_dir,
             theme_data_dir,
+            theme_includes_dir,
             markdown_layouts,
             change_callbacks: ChangeCallbacks::default(),
             hosting,
@@ -1340,6 +1345,7 @@ impl BaganCache {
             assets_dir: self.theme_assets_dir.to_string_lossy().to_string(),
             layouts_dir: self.theme_layouts_dir.to_string_lossy().to_string(),
             data_dir: self.theme_data_dir.to_string_lossy().to_string(),
+            includes_dir: self.theme_includes_dir.to_string_lossy().to_string(),
         };
         dirs
     }
