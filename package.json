@@ -1,7 +1,7 @@
 {
   "name": "@bagandev/bagan_cache",
-  "version": "0.1.21",
-  "gitHead": "9049b8b7c891c7e15f75575e562e6175500158a7",
+  "version": "0.1.22",
+  "gitHead": "1666f62bf44e2c380a08101f8d0f84eb74eea2c9",
   "description": "Run the filesystem watcher from the project root with:",
   "keywords": [],
   "homepage": "https://github.com/bagandev/bagan_cache#readme",
@@ -35,6 +35,9 @@
       }
     }
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "bash scripts/build.sh"
   },
@@ -48,8 +51,5 @@
   },
   "engines": {
     "node": "^20.19.0 || ^22.13.0 || >=23.5.0 || ^24.21.0"
-  },
-  "publishConfig": {
-    "access": "public"
   }
 }
