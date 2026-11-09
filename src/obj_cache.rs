@@ -74,6 +74,32 @@ pub struct AssetsObject {
     pub file_type: String,
 }
 
+/// A Liquid (`.html`) template tracked through one of the configured
+/// `liquidCollections` directories/files, rendered to HTML on the JS side
+/// through the `liquidRender(file)` callback.
+#[cfg_attr(feature = "npm", napi(object))]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiquidObject {
+    /// File name without extension (`foo.html` → `foo`).
+    pub file_name: String,
+    /// Request URL for the rendered file (`docs/foo.html` → `/docs/foo`);
+    /// the `html` extension is stripped and the resolved baseUrl is
+    /// prefixed.
+    pub slug: String,
+    /// Raw Liquid template content (UTF-8 text).
+    pub raw: String,
+    /// HTML rendered from the template by the JS-side `liquidRender`
+    /// callback. Empty when no callback is configured.
+    pub html: String,
+    /// Build output path (`path/to/foo.html` → `outDir/path/to/foo.html`).
+    pub out_file_path: String,
+    /// Original absolute source path (watch-process identity).
+    pub input_file_path: String,
+    /// File extension (lowercase, without dot).
+    pub ext: String,
+}
+
 /// Classify an asset extension into the `fileType` buckets.
 pub fn asset_file_type(ext: &str) -> &'static str {
     match ext {
@@ -96,6 +122,20 @@ pub fn file_name_no_ext(file_name: &str) -> String {
         Some(i) => file_name[..i].to_string(),
         None => file_name.to_string(),
     }
+}
+
+/// Strip the full Liquid extension from a file name: `foo.html` →
+/// `foo`, `foo.liquid` → `foo`, `foo.liquid.html` → `foo` (the whole
+/// `.liquid.html` suffix is one logical extension). Case-insensitive.
+pub fn liquid_file_name_no_ext(file_name: &str) -> String {
+    let lower = file_name.to_lowercase();
+    for suffix in [".liquid.html", ".liquid", ".html"] {
+        if lower.ends_with(suffix) {
+            let stem = &file_name[..file_name.len() - suffix.len()];
+            return stem.to_string();
+        }
+    }
+    file_name_no_ext(file_name)
 }
 
 /// Compute the URL slug for a markdown file relative to a base directory,
@@ -151,6 +191,57 @@ pub fn asset_out_file(path: &Path, base_dir: &Path, out_dir: &str) -> String {
         .to_string_lossy()
         .replace('\\', "/");
     format!("{}/{}", out_dir.trim_end_matches('/'), rel)
+}
+
+/// Compute the URL slug for a Liquid template file: the `html`/`liquid`
+/// extension is stripped (`docs/foo.html` → `/docs/foo`), the resolved
+/// baseUrl is prefixed, and the path is relative to `base_dir`.
+/// `liquid.html` keeps the final `.html` (`page.liquid.html` →
+/// `/page.html`) because the emitted file carries that extension.
+pub fn liquid_slug(path: &Path, base_dir: &Path, base_url: &str) -> String {
+    let rel = rel_to_base(path, base_dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let rel_l = rel.to_lowercase();
+    let strip_suffix_ci = |suffix: &str| -> String { rel[..rel.len() - suffix.len()].to_string() };
+    let slug = if rel_l.ends_with(".liquid.html") {
+        // `page.liquid.html` → `page.html` (the emitted file keeps `.html`).
+        format!("{}.html", strip_suffix_ci(".liquid.html"))
+    } else if rel_l.ends_with(".liquid") {
+        strip_suffix_ci(".liquid")
+    } else {
+        rel.rsplit_once('.')
+            .map(|(stem, _)| stem.to_string())
+            .unwrap_or(rel)
+    };
+    if slug.is_empty() {
+        base_url.trim_end_matches('/').to_string() + "/"
+    } else {
+        format!("{}/{}", base_url.trim_end_matches('/'), slug)
+    }
+}
+
+/// Compute the output path for a Liquid template file: `foo.html` →
+/// `outDir/foo.html`, `foo.liquid.html` → `outDir/foo.html`, and a plain
+/// `foo.liquid` renders to `outDir/foo.html`.
+pub fn liquid_out_file(path: &Path, base_dir: &Path, out_dir: &str) -> String {
+    let rel = rel_to_base(path, base_dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let rel_l = rel.to_lowercase();
+    let strip_suffix_ci = |suffix: &str| -> String { rel[..rel.len() - suffix.len()].to_string() };
+    let out = if rel_l.ends_with(".liquid.html") {
+        // `page.liquid.html` → `page.html`.
+        format!("{}.html", strip_suffix_ci(".liquid.html"))
+    } else if rel_l.ends_with(".liquid") {
+        // `foo.liquid` renders to `foo.html`.
+        format!("{}.html", strip_suffix_ci(".liquid"))
+    } else {
+        rel.rsplit_once('.')
+            .map(|(stem, ext)| format!("{stem}.{ext}"))
+            .unwrap_or(rel)
+    };
+    format!("{}/{}", out_dir.trim_end_matches('/'), out)
 }
 
 /// Path relative to `base_dir`, falling back to the full path with leading
@@ -327,6 +418,16 @@ mod tests {
     }
 
     #[test]
+    fn strips_full_liquid_extensions() {
+        assert_eq!(liquid_file_name_no_ext("about.html"), "about");
+        assert_eq!(liquid_file_name_no_ext("about.liquid"), "about");
+        assert_eq!(liquid_file_name_no_ext("about.LIQUID.html"), "about");
+        assert_eq!(liquid_file_name_no_ext("about.liquid.html"), "about");
+        assert_eq!(liquid_file_name_no_ext("noext"), "noext");
+        assert_eq!(liquid_file_name_no_ext(".hidden.html"), ".hidden");
+    }
+
+    #[test]
     fn slugs_collapse_index_pages() {
         let base = PathBuf::from("/site/contents");
         let root_index = PathBuf::from("/site/contents/index.md");
@@ -355,6 +456,33 @@ mod tests {
         let img = PathBuf::from("/site/public/img/logo.png");
         assert_eq!(asset_slug(&img, &base, "/"), "/img/logo.png");
         assert_eq!(asset_out_file(&img, &base, "dist"), "dist/img/logo.png");
+    }
+
+    #[test]
+    fn liquid_slugs_strip_html_extension() {
+        let base = PathBuf::from("/site/contents");
+        let page = PathBuf::from("/site/contents/about.html");
+        let nested = PathBuf::from("/site/contents/docs/guide.html");
+        let liquid = PathBuf::from("/site/contents/docs/note.liquid");
+        let double = PathBuf::from("/site/contents/docs/page.liquid.html");
+        let upper = PathBuf::from("/site/contents/docs/Note.LIQUID.HTML");
+        assert_eq!(liquid_slug(&page, &base, "/"), "/about");
+        assert_eq!(liquid_slug(&nested, &base, ""), "/docs/guide");
+        assert_eq!(liquid_slug(&liquid, &base, "/blog"), "/blog/docs/note");
+        // `page.liquid.html` keeps its emitted `.html` extension.
+        assert_eq!(liquid_slug(&double, &base, "/"), "/docs/page.html");
+        assert_eq!(liquid_slug(&upper, &base, "/"), "/docs/Note.html");
+    }
+
+    #[test]
+    fn liquid_out_files_map_to_html() {
+        let base = PathBuf::from("/site/contents");
+        let page = PathBuf::from("/site/contents/about.html");
+        let liquid = PathBuf::from("/site/contents/docs/note.liquid");
+        let double = PathBuf::from("/site/contents/docs/page.liquid.html");
+        assert_eq!(liquid_out_file(&page, &base, "out"), "out/about.html");
+        assert_eq!(liquid_out_file(&liquid, &base, "out"), "out/docs/note.html");
+        assert_eq!(liquid_out_file(&double, &base, "out"), "out/docs/page.html");
     }
 
     #[test]

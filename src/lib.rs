@@ -17,10 +17,13 @@
 //!   archive: { shardBytes: 8 * 1024 * 1024, flushIntervalMs: 2000 },
 //!   hosting: { provider: "GithubPages", repo: "site" },
 //!   outDir: "out",
+//!   liquidCollections: ["_pages", "about.html"],
+//!   liquidRender: (file) => renderLiquid(file), // JS-side Liquid → HTML
 //! });
 //! cache.pages();                    // PageObject[] — for Liquid themes
 //! cache.getPage("docs/intro.md");   // single page object (or null)
 //! cache.assets();                    // AssetsObject[]
+//! cache.liquids();                  // LiquidObject[] — rendered Liquid pages
 //! cache.mapJson();                   // the map.json document (search index)
 //! cache.archived();                  // paths flushed to the disk archive
 //! cache.startWatchingJs();           // keep everything in sync with the FS
@@ -63,6 +66,12 @@
 //! - *Assets*: files under the assets directory with a known image, script,
 //!   style, font, or audio/video extension. Binary types are cached as raw
 //!   bytes; `js`, `css`, `map`, and `svg` are cached as UTF-8 text.
+//! - *Liquid*: `.html` / `.liquid` files inside the configured
+//!   `liquidCollections` (directories are flattened recursively, files are
+//!   taken as-is; both are resolved against the entry directory and must
+//!   live inside it). Cached as UTF-8 text; the JS-side `liquidRender(file)`
+//!   callback renders them to HTML for
+//!   [`LiquidObject`](crate::LiquidObject) values.
 //!
 //! # Tiering
 //!
@@ -103,14 +112,15 @@ use def::{
 };
 pub use lru::LruCache;
 pub use obj_cache::{
-    AssetsObject, ObjectCache, PageObject, asset_file_type, asset_out_file, asset_slug,
-    extra_frontmatter_fields, file_name_no_ext, markdown_slug, page_out_file,
+    AssetsObject, LiquidObject, ObjectCache, PageObject, asset_file_type, asset_out_file,
+    asset_slug, extra_frontmatter_fields, file_name_no_ext, liquid_file_name_no_ext,
+    liquid_out_file, liquid_slug, markdown_slug, page_out_file,
 };
 use theme::{BaganThemeConfig, ThemeDirs};
 
 use file::{
-    ASSET_BINARY_EXTENSIONS, ASSET_EXTENSIONS, MARKDOWN_EXTENSIONS, collect_asset_files,
-    collect_markdown_files,
+    ASSET_BINARY_EXTENSIONS, ASSET_EXTENSIONS, LIQUID_EXTENSIONS, MARKDOWN_EXTENSIONS,
+    collect_asset_files, collect_markdown_files, has_liquid_extension,
 };
 #[cfg(feature = "npm")]
 use napi::bindgen_prelude::*;
@@ -139,6 +149,21 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// JS-side Liquid renderer for the configured `liquidCollections`
+/// (npm builds): a synchronous `liquidRender(file: string) => string`
+/// callback. Rendering must happen on the JS main thread — the same
+/// constraint as markdown visitor plugins — so the callback is stored as
+/// a `FunctionRef` and borrowed at render time (see
+/// [`RegisteredPlugin`](peisar::plugin::RegisteredPlugin) for the same
+/// pattern).
+#[cfg(feature = "npm")]
+pub type LiquidRenderer = FunctionRef<String, String>;
+
+/// Rust-side Liquid renderer for the configured `liquidCollections`
+/// (non-npm builds): takes the raw template text and returns HTML.
+#[cfg(not(feature = "npm"))]
+pub type LiquidRenderer = Box<dyn Fn(String) -> String + Send + Sync + 'static>;
 
 /// ANSI color escape sequences for the watcher's pretty logs (disabled
 /// automatically when stderr is not an interactive terminal).
@@ -197,6 +222,11 @@ fn log_trackable(path: &Path) -> bool {
             let ext_l = ext.to_lowercase();
             MARKDOWN_EXTENSIONS.contains(&ext_l.as_str())
                 || ASSET_EXTENSIONS.contains(&ext_l.as_str())
+                || LIQUID_EXTENSIONS.contains(&ext_l.as_str())
+                || path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.to_lowercase().ends_with(".liquid.html"))
         })
         .unwrap_or(false)
 }
@@ -284,20 +314,20 @@ pub struct BaganCacheConfig {
     /// Theme package name (Jekyll-gem style). When set, the theme is
     /// resolved from `node_modules/<theme>` and its default export is
     /// read as the theme configuration. When unset, the site is local:
-    /// the theme directories below are resolved from the current working
+    /// the theme directories below are resolved from the entry
     /// directory instead.
     pub theme: Option<String>,
     /// Local layouts directory (used when `theme` is unset), resolved
-    /// from the current working directory. Defaults to `_layouts`.
+    /// from the entry directory. Defaults to `_layouts`.
     pub theme_layouts_dir: Option<String>,
     /// Local includes directory (used when `theme` is unset), resolved
-    /// from the current working directory. Defaults to `_includes`.
+    /// from the entry directory. Defaults to `_includes`.
     pub theme_includes_dir: Option<String>,
     /// Local assets directory (used when `theme` is unset), resolved
-    /// from the current working directory. Defaults to `_assets`.
+    /// from the entry directory. Defaults to `_assets`.
     pub theme_assets_dir: Option<String>,
     /// Local data directory (used when `theme` is unset), resolved from
-    /// the current working directory. Defaults to `_data`.
+    /// the entry directory. Defaults to `_data`.
     pub theme_data_dir: Option<String>,
     /// Theme configuration object (`themeConfigObject`). In theme mode
     /// the napi constructor loads it automatically from the theme
@@ -322,6 +352,13 @@ pub struct BaganCacheConfig {
     /// Archive directory, relative to the current working directory
     /// (default `".peisar-cache"`).
     pub cache_dir: Option<String>,
+    /// Liquid (`.html`) collections inside the entry directory: each
+    /// entry is a directory (flattened recursively) or a single file,
+    /// resolved against the entry directory. The discovered files are
+    /// cached as text, watched for changes, and exposed as
+    /// [`LiquidObject`](crate::LiquidObject) values. Entries outside the
+    /// entry directory are rejected at construction.
+    pub liquid_collections: Option<Vec<String>>,
 }
 
 /// LRU budgets for the memory tier.
@@ -506,6 +543,27 @@ pub struct BaganCache {
     hosting: BaseDirInfo,
     /// Build output directory (for `outFilePath` fields).
     out_dir: String,
+    /// Liquid (`.html`) collections: tracked absolute files mapped to
+    /// their slug base directory (the collection root for directories,
+    /// the entry directory for single files). Clone-shared with the
+    /// watcher thread.
+    liquid_files: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+    /// Configured liquid collection roots (the raw resolved
+    /// directories/files from `liquidCollections`), used to re-flatten
+    /// after directory-level events. Clone-shared with the watcher thread.
+    liquid_collection_roots: Arc<Mutex<Vec<PathBuf>>>,
+    /// JS-side `liquidRender(file)` callback for LiquidObject.html (npm
+    /// builds hold a `FunctionRef` + the napi `Env` captured at
+    /// construction; rendering runs on the JS main thread only).
+    #[cfg(feature = "npm")]
+    liquid_renderer: Option<LiquidRenderer>,
+    /// Rust-side Liquid renderer (non-npm builds).
+    #[cfg(not(feature = "npm"))]
+    liquid_renderer: Option<LiquidRenderer>,
+    /// The napi `Env` captured at construction, used to `borrow_back` the
+    /// `liquidRenderer` callback (npm builds only).
+    #[cfg(feature = "npm")]
+    liquid_env: Option<Env>,
 }
 
 /// Build the event-loop keep-alive held while the watcher runs: a strong
@@ -814,8 +872,16 @@ impl BaganCache {
             hosting: options.as_ref().and_then(|o| o.hosting.clone()),
             out_dir: options.as_ref().and_then(|o| o.out_dir.clone()),
             cache_dir: options.as_ref().and_then(|o| o.cache_dir.clone()),
+            liquid_collections: options.as_ref().and_then(|o| o.liquid_collections.clone()),
             memory: None,
         };
+        // JS-side `liquidRender(file)` callback: received as a `Function`
+        // (napi objects cannot hold `FunctionRef` fields) and converted to
+        // a `FunctionRef` for later main-thread invocation.
+        let liquid_renderer: Option<LiquidRenderer> = options
+            .as_ref()
+            .and_then(|o| o.liquid_render.as_ref())
+            .and_then(|render| render.create_ref().ok());
         if let Some(theme_config) = options.as_ref().and_then(|o| o.theme_config.clone()) {
             config.theme_config = Some(theme_config);
         } else if let Some(theme_name) = config
@@ -835,12 +901,16 @@ impl BaganCache {
             let cwd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             config.theme_config = load_theme_config_from_module(&env, &cwd, theme_name)?;
         }
-        BaganCache::with_config(config)
+        BaganCache::with_config_liquid(config, liquid_renderer, Some(env))
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e}")))
     }
 
     /// JS: `BaganCache.withConfigJs(config)` — full configuration form,
-    /// including memory-tier budgets.
+    /// including memory-tier budgets. Liquid collections may be
+    /// configured through `liquidCollections`, but `liquidRender` is only
+    /// available on the constructor (the `withConfig` object cannot carry
+    /// functions across the boundary) — use `useLiquidRender()` to
+    /// register the callback afterwards.
     #[cfg(feature = "npm")]
     #[napi(factory)]
     pub fn with_config_js(config: BaganCacheConfig) -> Result<Self> {
@@ -852,14 +922,60 @@ impl BaganCache {
     ///
     /// Construction loads all markdown (and optionally assets) into the
     /// memory tier; disk writes happen later on the archive worker's
-    /// size/interval flush (or explicitly via [`Self::flush`]).
+    /// size/interval flush (or explicitly via [`Self::flush`]). Liquid
+    /// collections are resolved and loaded, but without a renderer the
+    /// `LiquidObject.html` field stays empty (Rust consumers can use
+    /// [`Self::use_liquid_render`]).
     pub fn with_config(config: BaganCacheConfig) -> io::Result<Self> {
+        #[cfg(feature = "npm")]
+        {
+            Self::with_config_liquid(config, None, None)
+        }
+        #[cfg(not(feature = "npm"))]
+        {
+            Self::with_config_liquid(config, None)
+        }
+    }
+
+    /// [`Self::with_config`] with an optional Liquid renderer: the JS
+    /// `liquidRender(file)` callback (npm builds) or a boxed Rust closure
+    /// (non-npm builds), invoked when `LiquidObject` values are built.
+    pub fn with_config_liquid(
+        config: BaganCacheConfig,
+        liquid_renderer: Option<LiquidRenderer>,
+        #[cfg(feature = "npm")] liquid_env: Option<Env>,
+    ) -> io::Result<Self> {
         let cwd = env::current_dir()?;
+        // Resolve the entry dir to an absolute path first: watcher events
+        // carry absolute paths, so the `is_markdown` prefix check needs an
+        // absolute entry_dir even when JS passes a relative one — and in
+        // local mode the theme directories below resolve from it.
+        let entry_dir = {
+            let d = Path::new(config.entry_dir.as_deref().unwrap_or("."));
+            if d.is_absolute() {
+                d.to_path_buf()
+            } else {
+                cwd.join(d)
+            }
+        };
+        if !MARKDOWN_EXTENSIONS
+            .iter()
+            .any(|ext| entry_dir.join(format!("index.{ext}")).is_file())
+        {
+            let message = format!(
+                "entry directory '{}' must contain an index file with a supported Markdown extension",
+                entry_dir.display()
+            );
+            eprintln!("BaganCache configuration error: {message}");
+            return Err(io::Error::new(io::ErrorKind::NotFound, message));
+        }
+        let entry_dir = fs::canonicalize(&entry_dir)?;
         // Resolve the theme (Jekyll-gem style):
         // - `theme` set → `node_modules/<theme>`, configuration from the
         //   package's default export (`themeConfigObject`).
         // - `theme` unset → local site; `_layouts`/`_includes`/`_assets`/
-        //   `_data` (or the configured overrides) resolved from the cwd.
+        //   `_data` (or the configured overrides) resolved from the
+        //   entry directory.
         let theme_name = config
             .theme
             .as_deref()
@@ -903,8 +1019,8 @@ impl BaganCache {
                 (theme_path, theme_config)
             }
             None => {
-                // Local mode: the theme directories live in the project
-                // itself, resolved from the current working directory.
+                // Local mode: the theme directories live inside the
+                // entry directory, which doubles as the theme root.
                 let theme_config = BaganThemeConfig {
                     layouts_dir: config.theme_layouts_dir.clone(),
                     includes_dir: config.theme_includes_dir.clone(),
@@ -912,7 +1028,7 @@ impl BaganCache {
                     data_dir: config.theme_data_dir.clone(),
                     ..Default::default()
                 };
-                (cwd.clone(), theme_config)
+                (entry_dir.clone(), theme_config)
             }
         };
         let theme_assets_dir = theme_path.join(theme_config.assets_dir_or_default());
@@ -927,30 +1043,6 @@ impl BaganCache {
             eprintln!("BaganCache configuration error: {message}");
             return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
         }
-        // Resolve the entry dir to an absolute path: watcher events carry
-        // absolute paths, so the `is_markdown` prefix check needs an
-        // absolute entry_dir even when JS passes a relative one.
-        let entry_dir = {
-            let d = Path::new(config.entry_dir.as_deref().unwrap_or("."));
-            if d.is_absolute() {
-                d.to_path_buf()
-            } else {
-                cwd.join(d)
-            }
-        };
-        if !MARKDOWN_EXTENSIONS
-            .iter()
-            .any(|ext| entry_dir.join(format!("index.{ext}")).is_file())
-        {
-            let message = format!(
-                "entry directory '{}' must contain an index file with a supported Markdown extension",
-                entry_dir.display()
-            );
-            eprintln!("BaganCache configuration error: {message}");
-            return Err(io::Error::new(io::ErrorKind::NotFound, message));
-        }
-        let entry_dir = fs::canonicalize(&entry_dir)?;
-
         // Assets are resolved from cwd and must remain inside entry_dir.
         let resolved_assets: Option<PathBuf> = match &config.assets_dir {
             Some(p) => {
@@ -989,6 +1081,61 @@ impl BaganCache {
                 Some(resolved)
             }
             None => None,
+        };
+        // Resolve the Liquid collections against the entry directory:
+        // each entry may be a directory (recursively flattened) or a
+        // single `.html`/`.liquid` file; the discovered files are merged
+        // into one deduplicated map (file → slug base directory). Files
+        // from a directory collection slug relative to the collection
+        // root; single files slug relative to the entry directory.
+        // Entries are resolved from the entry directory and must exist
+        // and live inside it — anything else is a configuration error.
+        let (liquid_files, liquid_roots): (HashMap<PathBuf, PathBuf>, Vec<PathBuf>) = {
+            let mut roots: Vec<PathBuf> = Vec::new();
+            let mut files: HashMap<PathBuf, PathBuf> = HashMap::new();
+            for entry in config.liquid_collections.iter().flatten() {
+                let trimmed = entry.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let candidate = entry_dir.join(trimmed);
+                let resolved = match fs::canonicalize(&candidate) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        let message = format!(
+                            "liquid collection '{}' does not exist or cannot be accessed: {error}",
+                            candidate.display()
+                        );
+                        eprintln!("BaganCache configuration error: {message}");
+                        return Err(io::Error::new(error.kind(), message));
+                    }
+                };
+                if !resolved.starts_with(&entry_dir) {
+                    let message = format!(
+                        "liquid collection '{}' must be inside entry directory '{}'",
+                        resolved.display(),
+                        entry_dir.display()
+                    );
+                    eprintln!("BaganCache configuration error: {message}");
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+                }
+                roots.push(resolved.clone());
+                if resolved.is_dir() {
+                    for path in file::collect_liquid_files(&resolved) {
+                        files.insert(path, resolved.clone());
+                    }
+                } else if has_liquid_extension(&resolved) {
+                    files.insert(resolved, entry_dir.clone());
+                } else {
+                    let message = format!(
+                        "liquid collection '{}' is neither a directory nor a Liquid file",
+                        resolved.display()
+                    );
+                    eprintln!("BaganCache configuration error: {message}");
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+                }
+            }
+            (files, roots)
         };
         // Get layouts names. In local mode the layouts directory may not
         // exist yet — that only means no markdown page matches a layout,
@@ -1035,7 +1182,7 @@ impl BaganCache {
             .map(HostingConfig::resolve)
             .unwrap_or_default();
 
-        // Discover and load markdown + assets into the memory tier.
+        // Discover and load markdown + assets (+ liquid) into the memory tier.
         let mut cache_map: HashMap<PathBuf, CachedContent> = HashMap::new();
         for (path, text) in collect_markdown_content(&entry_dir, &markdown_layouts)? {
             cache_map.insert(path, CachedContent::Text(text));
@@ -1045,6 +1192,13 @@ impl BaganCache {
         }
         if theme_assets_dir.is_dir() {
             cache_map.extend(collect_asset_content(&theme_assets_dir)?);
+        }
+        for path in liquid_files.keys() {
+            if !cache_map.contains_key(path)
+                && let Ok(text) = fs::read_to_string(path)
+            {
+                cache_map.insert(path.clone(), CachedContent::Text(text));
+            }
         }
         memory.replace_all(cache_map.clone());
 
@@ -1078,6 +1232,11 @@ impl BaganCache {
             change_callbacks: ChangeCallbacks::default(),
             hosting,
             out_dir,
+            liquid_files: Arc::new(Mutex::new(liquid_files)),
+            liquid_collection_roots: Arc::new(Mutex::new(liquid_roots)),
+            liquid_renderer,
+            #[cfg(feature = "npm")]
+            liquid_env,
         })
     }
 
@@ -1098,6 +1257,40 @@ impl BaganCache {
     #[napi]
     pub fn use_plugin(&mut self, env: Env, plugin: Plugin) {
         self.plugins.lock().unwrap().push(plugin.register(env));
+    }
+
+    /// JS: `cache.useLiquidRender(cb)` — register the JavaScript function
+    /// that renders a Liquid template to HTML
+    /// (`liquidRender(file: string) => string`). Called on the JS main
+    /// thread every time `liquids()` / `getLiquid()` builds a
+    /// [`LiquidObject`]; a callback that throws or returns a non-string
+    /// leaves `html` empty. Also accepts the callback through the
+    /// constructor option `liquidRender`.
+    #[cfg(feature = "npm")]
+    #[napi]
+    pub fn use_liquid_render(
+        &mut self,
+        env: Env,
+        #[napi(ts_arg_type = "(file: string) => string")] render: Function<'static, String, String>,
+    ) {
+        // The napi env is captured here too: `withConfigJs` consumers have
+        // none stored from construction, and the FunctionRef needs it to
+        // be borrowed back on the JS main thread.
+        self.liquid_env = Some(env);
+        self.liquid_renderer = render.create_ref().ok();
+    }
+
+    /// Register a Rust closure that renders Liquid templates to HTML for
+    /// `liquids()` / `get_liquid()` (non-npm builds). `withConfig`
+    /// consumers cannot pass functions through the napi config object,
+    /// so this is the Rust counterpart of the constructor's
+    /// `liquidRender` option.
+    #[cfg(not(feature = "npm"))]
+    pub fn use_liquid_render<F>(&mut self, render: F)
+    where
+        F: Fn(String) -> String + Send + Sync + 'static,
+    {
+        self.liquid_renderer = Some(Box::new(render));
     }
     /// JS: `cache.startWatchingJs()` — start watching the entry (and
     /// assets) directories recursively; errors surface as JS exceptions.
@@ -1144,6 +1337,13 @@ impl BaganCache {
         let theme_assets_dir = self.theme_assets_dir.clone();
         let markdown_layouts = self.markdown_layouts.clone();
         let change_callbacks = self.change_callbacks.clone();
+        // Liquid collection state (already flattened from directories):
+        // new/removed `.html`/`.liquid` files inside the configured
+        // collections update this shared list, so `liquids()` stays in
+        // sync with the filesystem while watching. Directory-level
+        // events re-flatten from the configured roots.
+        let liquid_files = Arc::clone(&self.liquid_files);
+        let liquid_roots = Arc::clone(&self.liquid_collection_roots);
         // Pretty logs render paths relative to the project root (the
         // cwd the cache was constructed in).
         let log_root = env::current_dir()?;
@@ -1213,6 +1413,33 @@ impl BaganCache {
                                         continue;
                                     }
                                 }
+                                // Re-resolve the liquid collections from
+                                // their configured roots: the removed/added
+                                // path may be a whole directory.
+                                let fresh_liquids = {
+                                    let roots = liquid_roots.lock().unwrap().clone();
+                                    let mut fresh: HashMap<PathBuf, PathBuf> = HashMap::new();
+                                    for root in &roots {
+                                        if root.is_dir() {
+                                            for path in file::collect_liquid_files(root) {
+                                                fresh.insert(path, root.clone());
+                                            }
+                                        } else if root.is_file() && has_liquid_extension(root) {
+                                            fresh.insert(root.clone(), entry_dir.clone());
+                                        }
+                                    }
+                                    fresh
+                                };
+                                for path in fresh_liquids.keys() {
+                                    if !new_map.contains_key(path)
+                                        && let Ok(text) = fs::read_to_string(path)
+                                    {
+                                        new_map.insert(path.clone(), CachedContent::Text(text));
+                                    }
+                                }
+                                *liquid_files.lock().unwrap() = fresh_liquids;
+                                // Entries no longer part of any collection
+                                // fall out of the replaced maps above.
                                 memory.replace_all(new_map.clone());
                                 archive.sync_all(new_map);
                                 continue;
@@ -1260,6 +1487,42 @@ impl BaganCache {
                                             archive.upsert(path, content);
                                         }
                                         None => {
+                                            memory.remove(&path);
+                                            archive.remove(path);
+                                        }
+                                    }
+                                } else if has_liquid_extension(&path)
+                                    && liquid_roots.lock().unwrap().iter().any(|root| {
+                                        root.is_file() && root == &path
+                                            || root.is_dir() && path.starts_with(root)
+                                    })
+                                {
+                                    // A `.html`/`.liquid` file inside one of
+                                    // the configured liquid collections:
+                                    // keep its text current in both tiers
+                                    // (new files join the tracked list,
+                                    // removed ones drop out).
+                                    match fs::read_to_string(&path) {
+                                        Ok(text) => {
+                                            let content = CachedContent::Text(text);
+                                            {
+                                                let mut tracked = liquid_files.lock().unwrap();
+                                                let base = liquid_roots
+                                                    .lock()
+                                                    .unwrap()
+                                                    .iter()
+                                                    .find(|root| {
+                                                        root.is_dir() && path.starts_with(root)
+                                                    })
+                                                    .cloned()
+                                                    .unwrap_or_else(|| entry_dir.clone());
+                                                tracked.entry(path.clone()).or_insert(base);
+                                            }
+                                            memory.insert(path.clone(), content.clone());
+                                            archive.upsert(path, content);
+                                        }
+                                        Err(_) => {
+                                            liquid_files.lock().unwrap().remove(&path);
                                             memory.remove(&path);
                                             archive.remove(path);
                                         }
@@ -1405,11 +1668,13 @@ impl BaganCache {
         };
         dirs
     }
-    /// JS: `cache.assetFiles()` — absolute paths of cached non-markdown
-    /// files (either tier).
+    /// JS: `cache.assetFiles()` — absolute paths of cached non-markdown,
+    /// non-liquid files (either tier).
     #[cfg_attr(feature = "npm", napi)]
     pub fn asset_files(&self) -> Vec<String> {
-        self.filter_cached_files(|ext| !MARKDOWN_EXTENSIONS.contains(&ext))
+        self.filter_cached_files(|ext| {
+            !MARKDOWN_EXTENSIONS.contains(&ext) && !LIQUID_EXTENSIONS.contains(&ext)
+        })
     }
 
     /// Filter the union of memory + archive keys by extension predicate.
@@ -1501,8 +1766,11 @@ impl BaganCache {
         self.page_object_for(Path::new(&input_path))
     }
 
-    /// Rust: every asset object, sorted by slug.
+    /// Rust: every asset object, sorted by slug. Liquid template files
+    /// (the configured collections) are not assets — see
+    /// [`Self::liquid_objects`].
     pub fn asset_objects(&self) -> Vec<AssetsObject> {
+        let tracked_liquids = self.liquid_files.lock().unwrap().clone();
         let mut assets: Vec<AssetsObject> = Vec::new();
         for path in self.all_keys() {
             if path
@@ -1510,6 +1778,7 @@ impl BaganCache {
                 .and_then(|e| e.to_str())
                 .map(|e| !MARKDOWN_EXTENSIONS.contains(&e))
                 .unwrap_or(false)
+                && !tracked_liquids.contains_key(&path)
                 && let Some(asset) = self.asset_object_for(&path)
             {
                 assets.push(asset);
@@ -1565,7 +1834,125 @@ impl BaganCache {
         self.asset_object_for(Path::new(&input_path))
     }
 
-    /// Absolute path to the configured theme package.
+    // ===== Liquid collection objects (rendered on the JS side) =====
+
+    /// Rust: every liquid object, sorted by slug.
+    pub fn liquid_objects(&self) -> Vec<LiquidObject> {
+        let tracked = self.liquid_files.lock().unwrap().clone();
+        let mut liquids: Vec<LiquidObject> = tracked
+            .iter()
+            .filter_map(|(path, base)| self.liquid_object_for_with_base(path, base))
+            .collect();
+        liquids.sort_by(|a, b| a.slug.cmp(&b.slug));
+        liquids
+    }
+
+    /// JS: `cache.liquids()` — every liquid object for the configured
+    /// `liquidCollections`, with HTML rendered by the JS-side
+    /// `liquidRender(file)` callback.
+    #[cfg_attr(feature = "npm", napi)]
+    pub fn liquids(&self) -> Vec<LiquidObject> {
+        self.liquid_objects()
+    }
+
+    /// Build one [`LiquidObject`] for a liquid template path (either
+    /// tier), slugging relative to its collection base directory: files
+    /// from a directory collection slug relative to the collection root,
+    /// single-file collections relative to the entry directory.
+    pub fn liquid_object_for(&self, path: &Path) -> Option<LiquidObject> {
+        let base = self
+            .liquid_files
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| self.entry_dir.clone());
+        self.liquid_object_for_with_base(path, &base)
+    }
+
+    /// [`Self::liquid_object_for`] with an explicit slug base directory.
+    fn liquid_object_for_with_base(&self, path: &Path, base: &Path) -> Option<LiquidObject> {
+        let content = self.get(path)?;
+        let raw = match content {
+            CachedContent::Text(s) => s,
+            _ => return None,
+        };
+        let fname = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
+        let html = self.render_liquid(&raw);
+        let base_url = self.hosting.base_url();
+        Some(LiquidObject {
+            file_name: liquid_file_name_no_ext(&fname),
+            slug: liquid_slug(path, base, &base_url),
+            raw,
+            html,
+            out_file_path: liquid_out_file(path, base, &self.out_dir),
+            input_file_path: path.to_string_lossy().to_string(),
+            ext,
+        })
+    }
+
+    /// JS: `cache.getLiquid(inputPath)` — a single liquid object by
+    /// absolute input path, or `null`.
+    #[cfg_attr(feature = "npm", napi)]
+    pub fn get_liquid(&self, input_path: String) -> Option<LiquidObject> {
+        self.liquid_object_for(Path::new(&input_path))
+    }
+
+    /// JS: `cache.liquidFiles()` — absolute paths of the tracked liquid
+    /// template files (either tier).
+    #[cfg_attr(feature = "npm", napi)]
+    pub fn liquid_files(&self) -> Vec<String> {
+        self.liquid_files
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect()
+    }
+
+    /// Render a liquid template to HTML through the registered renderer.
+    /// Returns an empty string when no renderer is configured or the
+    /// renderer fails; renderer errors print to stderr.
+    fn render_liquid(&self, raw: &str) -> String {
+        let Some(renderer) = &self.liquid_renderer else {
+            return String::new();
+        };
+        #[cfg(feature = "npm")]
+        {
+            let Some(env) = &self.liquid_env else {
+                return String::new();
+            };
+            let Ok(func) = renderer.borrow_back(env) else {
+                eprintln!("liquidRender callback could not be invoked");
+                return String::new();
+            };
+            // A single-argument call: the raw template text goes
+            // straight to the JS callback.
+            match func.call(raw.to_string()) {
+                Ok(html) => html,
+                Err(error) => {
+                    eprintln!("liquidRender callback failed: {error}");
+                    String::new()
+                }
+            }
+        }
+        #[cfg(not(feature = "npm"))]
+        {
+            renderer(raw.to_string())
+        }
+    }
+
+    /// Absolute path to the configured theme package — or, in local
+    /// mode (no `theme` configured), the entry directory the local
+    /// theme directories resolve from.
     #[cfg_attr(feature = "npm", napi)]
     pub fn theme_path(&self) -> String {
         self.theme_path.to_string_lossy().to_string()
@@ -1706,19 +2093,20 @@ impl BaganCache {
 pub struct BaganCacheJsOptions {
     /// Theme package name (Jekyll-gem style), resolved from
     /// `node_modules/<theme>`. Omit (null/undefined) for a local site:
-    /// the theme directories below are then resolved from the cwd.
+    /// the theme directories below are then resolved from the entry
+    /// directory.
     pub theme: Option<String>,
-    /// Local layouts directory (local mode only), relative to the cwd.
-    /// Defaults to `_layouts`.
+    /// Local layouts directory (local mode only), relative to the entry
+    /// directory. Defaults to `_layouts`.
     pub theme_layouts_dir: Option<String>,
-    /// Local includes directory (local mode only), relative to the cwd.
-    /// Defaults to `_includes`.
+    /// Local includes directory (local mode only), relative to the entry
+    /// directory. Defaults to `_includes`.
     pub theme_includes_dir: Option<String>,
     /// Local theme assets directory (local mode only), relative to the
-    /// cwd. Defaults to `_assets`.
+    /// entry directory. Defaults to `_assets`.
     pub theme_assets_dir: Option<String>,
-    /// Local data directory (local mode only), relative to the cwd.
-    /// Defaults to `_data`.
+    /// Local data directory (local mode only), relative to the entry
+    /// directory. Defaults to `_data`.
     pub theme_data_dir: Option<String>,
     /// Theme configuration object (`themeConfigObject`). When omitted
     /// (and `theme` is set) it is loaded automatically from the theme
@@ -1734,6 +2122,18 @@ pub struct BaganCacheJsOptions {
     pub out_dir: Option<String>,
     /// Disk-archive directory.
     pub cache_dir: Option<String>,
+    /// Liquid (`.html`) collections inside the entry directory: each
+    /// entry is a directory (flattened recursively) or a single file,
+    /// resolved against the entry directory. The discovered files are
+    /// cached as text, watched, and exposed through `cache.liquids()`.
+    pub liquid_collections: Option<Vec<String>>,
+    /// JavaScript function that renders a Liquid template to HTML
+    /// (`liquidRender(file: string) => string`). Invoked on the JS main
+    /// thread when liquid objects are built; a callback that throws or
+    /// returns a non-string leaves the `html` field empty. Registerable
+    /// later with `useLiquidRender()` as well.
+    #[napi(ts_type = "(file: string) => string")]
+    pub liquid_render: Option<Function<'static, String, String>>,
 }
 
 // Dropping a `BaganCache` is the Rust equivalent of the JS `dispose()`:
@@ -1791,6 +2191,13 @@ mod tests {
         f.sync_all().unwrap();
     }
 
+    /// Write one (empty) layout template into `dir/_layouts`.
+    fn write_layout(dir: &Path, name: &str) {
+        let layouts = dir.join("_layouts");
+        fs::create_dir_all(&layouts).unwrap();
+        fs::write(layouts.join(format!("{name}.html")), "").unwrap();
+    }
+
     fn restore(orig: PathBuf, tmp: PathBuf) {
         let _ = env::set_current_dir(orig);
         let _ = fs::remove_dir_all(tmp);
@@ -1835,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn local_theme_dirs_default_to_cwd() -> io::Result<()> {
+    fn local_theme_dirs_default_to_entry_dir() -> io::Result<()> {
         let _guard = TEST_CWD_LOCK.lock().unwrap();
         let (tmp, orig) = make_tmp("localdirs")?;
         env::set_current_dir(&tmp)?;
@@ -1844,23 +2251,36 @@ mod tests {
             "contents/index.md",
             "---\nlayout: home\n---\n# Home\n",
         );
-        fs::create_dir_all(tmp.join("_assets/css"))?;
-        fs::write(tmp.join("_assets/css/site.css"), "body {}")?;
-        fs::create_dir_all(tmp.join("_includes"))?;
-        fs::create_dir_all(tmp.join("_data"))?;
+        write_layout(&tmp.join("contents"), "home");
+        fs::create_dir_all(tmp.join("contents/_assets/css"))?;
+        fs::write(tmp.join("contents/_assets/css/site.css"), "body {}")?;
+        fs::create_dir_all(tmp.join("contents/_includes"))?;
+        fs::create_dir_all(tmp.join("contents/_data"))?;
 
         let cache = BaganCache::with_config(BaganCacheConfig {
             entry_dir: Some("contents".into()),
             ..Default::default()
         })?;
 
-        // No theme configured: the theme dirs resolve from the cwd.
-        assert_eq!(cache.theme_path(), tmp.to_string_lossy().to_string());
+        // No theme configured: the theme dirs resolve from the entry dir.
+        assert_eq!(
+            cache.theme_path(),
+            tmp.join("contents").to_string_lossy().to_string()
+        );
         let dirs = cache.theme_dirs();
-        assert_eq!(dirs.layouts_dir, tmp.join("_layouts").to_string_lossy());
-        assert_eq!(dirs.includes_dir, tmp.join("_includes").to_string_lossy());
-        assert_eq!(dirs.assets_dir, tmp.join("_assets").to_string_lossy());
-        assert_eq!(dirs.data_dir, tmp.join("_data").to_string_lossy());
+        assert_eq!(
+            dirs.layouts_dir,
+            tmp.join("contents/_layouts").to_string_lossy()
+        );
+        assert_eq!(
+            dirs.includes_dir,
+            tmp.join("contents/_includes").to_string_lossy()
+        );
+        assert_eq!(
+            dirs.assets_dir,
+            tmp.join("contents/_assets").to_string_lossy()
+        );
+        assert_eq!(dirs.data_dir, tmp.join("contents/_data").to_string_lossy());
         assert_eq!(cache.pages().len(), 1);
         let assets = cache.assets();
         assert_eq!(assets.len(), 1);
@@ -1881,12 +2301,12 @@ mod tests {
             "contents/index.md",
             "---\nlayout: main\n---\n# Home\n",
         );
-        fs::create_dir_all(tmp.join("templates"))?;
-        fs::write(tmp.join("templates/main.html"), "")?;
-        fs::create_dir_all(tmp.join("partial"))?;
-        fs::create_dir_all(tmp.join("static/img"))?;
-        fs::write(tmp.join("static/img/logo.png"), vec![1u8, 2])?;
-        fs::create_dir_all(tmp.join("dataset"))?;
+        fs::create_dir_all(tmp.join("contents/templates"))?;
+        fs::write(tmp.join("contents/templates/main.html"), "")?;
+        fs::create_dir_all(tmp.join("contents/partial"))?;
+        fs::create_dir_all(tmp.join("contents/static/img"))?;
+        fs::write(tmp.join("contents/static/img/logo.png"), vec![1u8, 2])?;
+        fs::create_dir_all(tmp.join("contents/dataset"))?;
 
         let cache = BaganCache::with_config(BaganCacheConfig {
             entry_dir: Some("contents".into()),
@@ -1898,10 +2318,22 @@ mod tests {
         })?;
 
         let dirs = cache.theme_dirs();
-        assert_eq!(dirs.layouts_dir, tmp.join("templates").to_string_lossy());
-        assert_eq!(dirs.includes_dir, tmp.join("partial").to_string_lossy());
-        assert_eq!(dirs.assets_dir, tmp.join("static").to_string_lossy());
-        assert_eq!(dirs.data_dir, tmp.join("dataset").to_string_lossy());
+        assert_eq!(
+            dirs.layouts_dir,
+            tmp.join("contents/templates").to_string_lossy()
+        );
+        assert_eq!(
+            dirs.includes_dir,
+            tmp.join("contents/partial").to_string_lossy()
+        );
+        assert_eq!(
+            dirs.assets_dir,
+            tmp.join("contents/static").to_string_lossy()
+        );
+        assert_eq!(
+            dirs.data_dir,
+            tmp.join("contents/dataset").to_string_lossy()
+        );
         assert!(
             cache
                 .markdown_layouts()
@@ -2223,6 +2655,7 @@ mod tests {
             "docs/doc1.md",
             "---\ntitle: Test\nlayout: default\n---\n# Hello\n",
         );
+        write_layout(&tmp.join("docs"), "default");
 
         let cache = BaganCache::with_config(BaganCacheConfig {
             entry_dir: Some("docs".into()),
@@ -2259,6 +2692,7 @@ mod tests {
         env::set_current_dir(&tmp)?;
         write_md(&tmp, "docs/index.md", "---\nlayout: default\n---\n# Home\n");
         write_md(&tmp, "docs/a.md", "---\nlayout: default\n---\n# A\n");
+        write_layout(&tmp.join("docs"), "default");
 
         let cache = BaganCache::new("docs")?;
         cache.flush();
@@ -2295,7 +2729,8 @@ mod tests {
             "---\nlayout: docs\n---\n# Intro\n",
         );
         write_md(&tmp, "outside.md", "---\nlayout: custom\n---\n# Outside\n");
-        fs::write(tmp.join("_layouts").join("custom.html"), "")?;
+        write_layout(&tmp.join("contents"), "custom");
+        write_layout(&tmp.join("contents"), "docs");
 
         let cache = BaganCache::with_config(BaganCacheConfig {
             entry_dir: Some("contents".into()),
@@ -2365,6 +2800,7 @@ mod tests {
             tmp.join("contents/public").join("img").join("logo.png"),
             vec![1u8, 2, 3],
         )?;
+        write_layout(&tmp.join("contents"), "default");
 
         let cache = BaganCache::with_config(BaganCacheConfig {
             entry_dir: Some("contents".into()),
@@ -2389,6 +2825,210 @@ mod tests {
     }
 
     #[test]
+    fn liquid_collections_flatten_and_render() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("liquid")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+        write_layout(&tmp.join("contents"), "default");
+        // Collection directory with nested liquid files + a single file.
+        fs::create_dir_all(tmp.join("contents/_pages/docs"))?;
+        fs::write(
+            tmp.join("contents/_pages/about.html"),
+            "<h1>About {{ title }}</h1>",
+        )?;
+        fs::write(tmp.join("contents/_pages/docs/guide.html"), "<p>Guide</p>")?;
+        fs::write(tmp.join("contents/contact.liquid"), "<p>Contact</p>")?;
+
+        let mut cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["_pages".into(), "contact.liquid".into()]),
+            ..Default::default()
+        })?;
+        // Rust-side renderer (JS consumers pass `liquidRender` instead).
+        #[cfg(not(feature = "npm"))]
+        cache.use_liquid_render(|file: String| file.replace("{{ title }}", "Bagan"));
+
+        // Directories are flattened and merged with configured files.
+        let files = cache.liquid_files();
+        assert_eq!(files.len(), 3);
+        let liquids = cache.liquid_objects();
+        assert_eq!(liquids.len(), 3);
+
+        let about = liquids
+            .iter()
+            .find(|l| l.input_file_path.ends_with("about.html"))
+            .unwrap();
+        assert_eq!(about.file_name, "about");
+        assert_eq!(about.ext, "html");
+        assert_eq!(about.slug, "/about");
+        assert_eq!(about.out_file_path, ".bagan/about.html");
+        assert_eq!(about.raw, "<h1>About {{ title }}</h1>");
+        // Rendered through the Rust-side closure (non-npm builds only —
+        // npm tests exercise the JS `liquidRender` callback instead).
+        #[cfg(not(feature = "npm"))]
+        assert_eq!(about.html, "<h1>About Bagan</h1>");
+
+        let guide = liquids
+            .iter()
+            .find(|l| l.input_file_path.ends_with("guide.html"))
+            .unwrap();
+        assert_eq!(guide.slug, "/docs/guide");
+        assert_eq!(guide.out_file_path, ".bagan/docs/guide.html");
+
+        let contact = liquids
+            .iter()
+            .find(|l| l.input_file_path.ends_with("contact.liquid"))
+            .unwrap();
+        assert_eq!(contact.ext, "liquid");
+        assert_eq!(contact.slug, "/contact");
+        assert_eq!(contact.out_file_path, ".bagan/contact.html");
+
+        // Liquid files are cached (either tier) and stay out of
+        // `assets()`/`assetFiles()`.
+        assert_eq!(cache.asset_objects().len(), 0);
+        assert!(
+            !cache
+                .asset_files()
+                .iter()
+                .any(|p| p.ends_with("about.html"))
+        );
+        // Without a renderer the html field stays empty.
+        let bare = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["_pages".into(), "contact.liquid".into()]),
+            ..Default::default()
+        })?;
+        assert!(bare.liquid_objects().iter().all(|l| l.html.is_empty()));
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn liquid_collections_must_live_inside_entry_dir() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("liquidoutside")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+        write_layout(&tmp.join("contents"), "default");
+        fs::create_dir("outside")?;
+        fs::write("outside/evil.html", "<p>no</p>")?;
+
+        // Outside the entry directory → InvalidInput.
+        let outside = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["../outside".into()]),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "outside liquid collection unexpectedly succeeded",
+                ));
+            }
+        };
+        assert_eq!(outside.kind(), io::ErrorKind::InvalidInput);
+
+        // Missing collection → NotFound.
+        let missing = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["_missing".into()]),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "missing liquid collection unexpectedly succeeded",
+                ));
+            }
+        };
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+
+        // A non-liquid file inside the entry dir → InvalidInput.
+        fs::write("contents/notes.txt", "plain")?;
+        let non_liquid = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["notes.txt".into()]),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "non-liquid collection unexpectedly succeeded",
+                ));
+            }
+        };
+        assert_eq!(non_liquid.kind(), io::ErrorKind::InvalidInput);
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn watcher_tracks_new_and_removed_liquid_files() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("liquidwatch")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+        write_layout(&tmp.join("contents"), "default");
+        fs::create_dir_all(tmp.join("contents/_pages"))?;
+        fs::write(tmp.join("contents/_pages/a.html"), "<p>A</p>")?;
+
+        let mut cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["_pages".into()]),
+            ..Default::default()
+        })?;
+        cache.start_watching()?;
+        assert_eq!(cache.liquid_files().len(), 1);
+
+        // Create a new liquid file inside the collection.
+        let new_path = tmp.join("contents/_pages/b.html");
+        fs::write(&new_path, "<p>B</p>")?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if cache.liquid_files().iter().any(|p| p.ends_with("b.html")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(cache.liquid_files().iter().any(|p| p.ends_with("b.html")));
+        assert!(cache.get(&new_path).is_some());
+
+        // Remove it again.
+        fs::remove_file(&new_path)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if !cache.liquid_files().iter().any(|p| p.ends_with("b.html")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !cache.liquid_files().iter().any(|p| p.ends_with("b.html")),
+            "removed liquid file remained tracked"
+        );
+        assert!(cache.get(&new_path).is_none());
+
+        cache.stop_watching();
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
     fn lru_eviction_falls_through_to_archive() -> io::Result<()> {
         let _guard = TEST_CWD_LOCK.lock().unwrap();
         let (tmp, orig) = make_tmp("evict")?;
@@ -2403,6 +3043,7 @@ mod tests {
             "docs/big.md",
             "---\nlayout: default\n---\n# Big\nBody padding to exceed the budget.\n",
         );
+        write_layout(&tmp.join("docs"), "default");
 
         let cache = BaganCache::with_config(BaganCacheConfig {
             entry_dir: Some("docs".into()),
@@ -2440,6 +3081,7 @@ mod tests {
             "contents/index.md",
             "---\nlayout: default\n---\n# Home\n",
         );
+        write_layout(&tmp.join("contents"), "default");
 
         let cache = BaganCache::with_config(BaganCacheConfig {
             entry_dir: Some("contents".into()),
@@ -2468,6 +3110,7 @@ mod tests {
         fs::write(".gitignore", format!("{DEFAULT_ARCHIVE_DIR_NAME}\n"))?;
         write_md(&tmp, "docs/index.md", "---\nlayout: default\n---\n# Home\n");
         write_md(&tmp, "docs/doc2.md", "# No frontmatter\nContent\n");
+        write_layout(&tmp.join("docs"), "default");
 
         let _cache = BaganCache::new("docs")?;
 
@@ -2495,6 +3138,7 @@ mod tests {
             "docs/tagged.md",
             "---\ntitle: Tagged\nlayout: default\ntags:\n  - x\n---\n# Tagged\n",
         );
+        write_layout(&tmp.join("docs"), "default");
 
         let cache = BaganCache::new("docs")?;
         cache.flush();
@@ -2573,6 +3217,7 @@ mod tests {
             "docs/index.md",
             "---\nlayout: default\n---\n# Known\n",
         );
+        write_layout(&tmp.join("docs"), "default");
 
         let cache = BaganCache::new("docs")?;
 
@@ -2648,6 +3293,7 @@ mod tests {
         let (tmp, orig) = make_tmp("stopwatch")?;
         env::set_current_dir(&tmp)?;
         write_md(&tmp, "docs/index.md", "---\nlayout: default\n---\n# A\n");
+        write_layout(&tmp.join("docs"), "default");
 
         let mut cache = BaganCache::new("docs")?;
         // Stop without start, then stop twice — all must be no-ops.
@@ -2669,6 +3315,7 @@ mod tests {
         env::set_current_dir(&tmp)?;
         write_md(&tmp, "docs/index.md", "---\nlayout: default\n---\n# Home\n");
         write_md(&tmp, "docs/a.md", "---\nlayout: default\n---\n# A\n");
+        write_layout(&tmp.join("docs"), "default");
 
         let mut cache = BaganCache::new("docs")?;
         let path = tmp.join("docs/a.md");
