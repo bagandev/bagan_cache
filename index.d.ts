@@ -1,5 +1,5 @@
 // Generated from ci.yml
-// napi-rs helper types
+// napi-rs helper types 
 export type PeisarEmphasisLevel = "Italic" | "Bold";
 export type PeisarTableCellAlignment = "Default" | "Left" | "Center" | "Right";
 export type PeisarTableCellAlignments = PeisarTableCellAlignment[];
@@ -17,7 +17,7 @@ export type BaganHostingProvider =
  * flavor napi-rs can build is listed, because `NAPI_RS_NATIVE_LIBRARY_PATH`
  * can point the loader at a WASI artifact this package does not build itself.
  */
-export declare const __napiBindingTarget: "native" | "wasm32-wasi" | "wasm32-wasip1";
+export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-wasip1'
 
 /**
  * In-memory + archive-backed cache of the Markdown and asset files under a
@@ -39,11 +39,7 @@ export declare class BaganCache {
    * (or import) the theme package and pass the export through. Register
    * custom visitors and parser hooks afterwards with `usePlugin()`.
    */
-  constructor(
-    entryDir?: string | undefined | null,
-    assetsDir?: string | undefined | null,
-    options?: BaganCacheJsOptions | undefined | null,
-  );
+  constructor(entryDir?: string | undefined | null, assetsDir?: string | undefined | null, options?: BaganCacheJsOptions | undefined | null)
   /**
    * JS: `BaganCache.withConfigJs(config)` — full configuration form,
    * including memory-tier budgets. Liquid collections may be
@@ -52,22 +48,28 @@ export declare class BaganCache {
    * functions across the boundary) — use `useLiquidRender()` to
    * register the callback afterwards.
    */
-  static withConfigJs(config: BaganCacheConfig): BaganCache;
+  static withConfigJs(config: BaganCacheConfig): BaganCache
   /**
    * Register a JavaScript plugin applied to every page render
    * (JS: `cache.usePlugin({ visitBlock, visitInline, parseBlock, parseInline })`).
    */
-  usePlugin(plugin: Plugin): void;
+  usePlugin(plugin: Plugin): void
   /**
    * JS: `cache.useLiquidRender(cb)` — register the JavaScript function
-   * that renders a Liquid template to HTML
-   * (`liquidRender(file: string) => string`). Called on the JS main
-   * thread every time `liquids()` / `getLiquid()` builds a
-   * [`LiquidObject`]; a callback that throws or returns a non-string
-   * leaves `html` empty. Also accepts the callback through the
-   * constructor option `liquidRender`.
+   * that renders a Liquid collection file to a page
+   * (`liquidRender(file: string) => PageObject`). The callback
+   * extracts the front matter, renders the Liquid content to HTML,
+   * and returns the page fields (converted leniently — `html` is the
+   * meaningful field, anything else falls back to the raw front
+   * matter); the cache fills the path-derived fields (fileName,
+   * slug, outFilePath, inputFilePath) and `raw` itself. Called on
+   * the JS main thread every time `liquids()` / `getLiquid()` builds
+   * a [`LiquidObject`]; a callback that throws or returns nothing
+   * leaves the front-matter fields empty and `html` as the raw
+   * template. Also accepts the callback through the constructor
+   * option `liquidRender`.
    */
-  useLiquidRender(render: (file: string) => string): void;
+  useLiquidRender(render: (file: string) => PageObject): void
   /**
    * JS: `cache.startWatchingJs()` — start watching the entry (and
    * assets) directories recursively; errors surface as JS exceptions.
@@ -78,115 +80,116 @@ export declare class BaganCache {
    * exit) stops the watcher. Without it, the native watcher thread is
    * invisible to libuv and Node exits as soon as the script ends.
    */
-  startWatchingJs(): void;
+  startWatchingJs(): void
   /**
    * JS: `cache.getText(absPath)` — cached text of a file, or `null`.
    * Reads fall through to the archive tier for evicted entries.
    */
-  getText(absPath: string): string | null;
+  getText(absPath: string): string | null
   /**
    * JS: `cache.getBinary(absPath)` — cached bytes of a binary asset, or
    * `null`. Reads fall through to the archive tier.
    */
-  getBinary(absPath: string): Array<number> | null;
+  getBinary(absPath: string): Array<number> | null
   /**
    * JS: `cache.listFiles()` — absolute paths of everything cached
    * (memory + archive tiers).
    */
-  listFiles(): Array<string>;
+  listFiles(): Array<string>
   /**
    * JS: `cache.markdownFiles()` — absolute paths of cached markdown
    * files (either tier).
    */
-  markdownFiles(): Array<string>;
+  markdownFiles(): Array<string>
   /**
    * Accepted Markdown layouts discovered from the theme's `.html`
    * templates, sorted by name.
    *
    * JS: `cache.markdownLayouts()`.
    */
-  markdownLayouts(): Array<string>;
+  markdownLayouts(): Array<string>
   /**
    * Absolute paths to the configured theme's layouts, assets, and data
    * directories.
    */
-  themeDirs(): ThemeDirs;
+  themeDirs(): ThemeDirs
   /**
    * JS: `cache.assetFiles()` — absolute paths of cached non-markdown,
    * non-liquid files (either tier).
    */
-  assetFiles(): Array<string>;
+  assetFiles(): Array<string>
   /**
    * JS: `cache.pages()` — every page object, for Liquid themes
    * (`{{ page.title }}`, `{{ page.layout }}`, …).
    */
-  pages(): Array<PageObject>;
+  pages(): Array<PageObject>
   /**
    * JS: `cache.getPage(inputPath)` — a single page object by absolute
    * input path, or `null`.
    */
-  getPage(inputPath: string): PageObject | null;
+  getPage(inputPath: string): PageObject | null
   /** JS: `cache.assets()` — every asset object. */
-  assets(): Array<AssetsObject>;
+  assets(): Array<AssetsObject>
   /**
    * JS: `cache.getAsset(inputPath)` — a single asset object by absolute
    * input path, or `null`.
    */
-  getAsset(inputPath: string): AssetsObject | null;
+  getAsset(inputPath: string): AssetsObject | null
   /**
    * JS: `cache.liquids()` — every liquid object for the configured
-   * `liquidCollections`, with HTML rendered by the JS-side
-   * `liquidRender(file)` callback.
+   * `liquidCollections`: front-matter fields from the JS-side
+   * `liquidRender(file)` callback (which also renders the HTML),
+   * path-derived fields from the cache.
    */
-  liquids(): Array<LiquidObject>;
+  liquids(): Array<LiquidObject>
   /**
    * JS: `cache.getLiquid(inputPath)` — a single liquid object by
    * absolute input path, or `null`.
    */
-  getLiquid(inputPath: string): LiquidObject | null;
+  getLiquid(inputPath: string): LiquidObject | null
   /**
    * JS: `cache.liquidFiles()` — absolute paths of the tracked liquid
    * template files (either tier).
    */
-  liquidFiles(): Array<string>;
+  liquidFiles(): Array<string>
   /**
    * Absolute path to the configured theme package — or, in local
    * mode (no `theme` configured), the entry directory the local
    * theme directories resolve from.
    */
-  themePath(): string;
+  themePath(): string
   /** Parsed theme metadata exposed as an object to Rust and JavaScript. */
-  themeConfig(): BaganThemeConfig;
+  themeConfig(): BaganThemeConfig
   /**
    * JS: `cache.archived()` — absolute paths flushed to the disk
    * archive. Everything not listed still lives in memory only.
    */
-  archived(): Array<string>;
+  archived(): Array<string>
   /**
    * JS: `cache.mapJson()` — the current `map.json` document (path →
    * shard location + metadata, including front matter for search).
    */
-  mapJson(): string;
+  mapJson(): string
   /**
    * JS: `cache.flush()` — write all pending archive entries now,
    * blocking until the worker is done.
    */
-  flush(): void;
+  flush(): void
   /**
    * JS: `cache.baseUrl()` — the resolved base URL path prefix for the
    * configured hosting (e.g. `/repo/` for a GitHub Pages project site).
    */
-  baseUrl(): string;
+  baseUrl(): string
   /**
    * JS: `cache.resolveUrl(path)` — prefix a site-relative path with the
    * resolved base URL: `resolveUrl("docs/intro")` → `/repo/docs/intro`.
    */
-  resolveUrl(path: string): string;
+  resolveUrl(path: string): string
   /**
    * JS: `cache.siteUrl()` — absolute origin URL for canonical URLs, or
    * `null` when not configured.
    */
-  siteUrl(): string | null;
+  siteUrl(): string | null
   /**
    * JS: `cache.onChange(cb)` — invoke `cb(event)` on every file change the
    * watcher detects while watching is active. Returns a subscription id
@@ -195,9 +198,9 @@ export declare class BaganCache {
    * The callback is wrapped in a `ThreadsafeFunction` because notify
    * events fire on the watcher thread, not the JS main thread.
    */
-  onChange(callback: (event: CacheChangeEvent) => void): number;
+  onChange(callback: (event: CacheChangeEvent) => void): number
   /** JS: `cache.offChange(id)` — remove a previously registered callback. */
-  offChange(id: number): void;
+  offChange(id: number): void
   /**
    * JS: `cache.dispose()` — stop the watcher, flush pending archive
    * writes, and drop JS change callbacks. Safe to call more than once.
@@ -205,7 +208,7 @@ export declare class BaganCache {
    * Rust consumers do not need this: dropping the [`BaganCache`] stops
    * the watcher, flushes the archive, and joins the workers.
    */
-  dispose(): void;
+  dispose(): void
 }
 
 /** Flush thresholds for the disk-archive tier. */
@@ -214,33 +217,33 @@ export interface ArchiveConfig {
    * Pending-content threshold (bytes) that triggers writing a new
    * shard; `0` disables size-based flushing (interval/drop only).
    */
-  shardBytes?: number;
+  shardBytes?: number
   /**
    * Maximum time (ms) pending entries may sit in the worker buffer
    * before being flushed. `0` disables the timer.
    */
-  flushIntervalMs?: number;
+  flushIntervalMs?: number
 }
 
 /** An asset mirrored by the cache (JS/CSS/image/video/font/…). */
 export interface AssetsObject {
   /** File name without extension (`foo.png` → `foo`). */
-  fileName: string;
+  fileName: string
   /** URL for the asset (`path/to/foo.png` → `/path/to/foo.png`). */
-  slug: string;
+  slug: string
   /** Raw content: UTF-8 text for textual assets, base64 for binaries. */
-  raw: string;
+  raw: string
   /** Build output path for the asset. */
-  outFilePath: string;
+  outFilePath: string
   /** Original absolute source path (watch-process identity). */
-  inputFilePath: string;
+  inputFilePath: string
   /** File extension (lowercase, without dot). */
-  ext: string;
+  ext: string
   /**
    * Kind classification: `"Js"`, `"Css"`, `"Image"`, `"Video"`,
    * `"Font"`, or `"Other"`.
    */
-  fileType: string;
+  fileType: string
 }
 
 /**
@@ -252,12 +255,12 @@ export interface BaganCacheConfig {
    * Entry directory holding the markdown files (absolute, or relative
    * to the current working directory). Defaults to the current directory.
    */
-  entryDir?: string;
+  entryDir?: string
   /**
    * Optional assets directory, resolved from the current working
    * directory and required to be inside `entry_dir`.
    */
-  assetsDir?: string;
+  assetsDir?: string
   /**
    * Theme package name (Jekyll-gem style). When set, the theme is
    * resolved from `node_modules/<theme>` and its default export is
@@ -265,27 +268,27 @@ export interface BaganCacheConfig {
    * the theme directories below are resolved from the entry
    * directory instead.
    */
-  theme?: string;
+  theme?: string
   /**
    * Local layouts directory (used when `theme` is unset), resolved
    * from the entry directory. Defaults to `_layouts`.
    */
-  themeLayoutsDir?: string;
+  themeLayoutsDir?: string
   /**
    * Local includes directory (used when `theme` is unset), resolved
    * from the entry directory. Defaults to `_includes`.
    */
-  themeIncludesDir?: string;
+  themeIncludesDir?: string
   /**
    * Local assets directory (used when `theme` is unset), resolved
    * from the entry directory. Defaults to `_assets`.
    */
-  themeAssetsDir?: string;
+  themeAssetsDir?: string
   /**
    * Local data directory (used when `theme` is unset), resolved from
    * the entry directory. Defaults to `_data`.
    */
-  themeDataDir?: string;
+  themeDataDir?: string
   /**
    * Theme configuration object (`themeConfigObject`). In theme mode
    * the napi constructor loads it automatically from the theme
@@ -293,32 +296,32 @@ export interface BaganCacheConfig {
    * automatic load (required for pure-Rust consumers, which have no
    * JS runtime to evaluate the export). Ignored when `theme` is unset.
    */
-  themeConfig?: BaganThemeConfig;
+  themeConfig?: BaganThemeConfig
   /**
    * Markdown parsing/rendering options applied to every page render
    * (GFM/Kramdown toggles, `fragment`, title, …). Custom visitors and
    * parser hooks are registered separately via `usePlugin()`.
    */
-  markdown?: PeisarOptions;
+  markdown?: PeisarOptions
   /**
    * Memory-tier budgets (LRU eviction). Defaults: 64 MiB bytes,
    * unlimited entries.
    */
-  memory?: MemoryConfig;
+  memory?: MemoryConfig
   /** Disk-archive tier thresholds. Defaults: 8 MiB shards, 2 s flush. */
-  archive?: ArchiveConfig;
+  archive?: ArchiveConfig
   /** Static-hosting baseUrl resolution (GitHub Pages/Vercel/…). */
-  hosting?: HostingConfig;
+  hosting?: HostingConfig
   /**
    * Build output directory used for `outFilePath` fields (default
    * `".bagan"`).
    */
-  outDir?: string;
+  outDir?: string
   /**
    * Archive directory, relative to the current working directory
    * (default `".peisar-cache"`).
    */
-  cacheDir?: string;
+  cacheDir?: string
   /**
    * Liquid (`.html`) collections inside the entry directory: each
    * entry is a directory (flattened recursively) or a single file,
@@ -327,7 +330,7 @@ export interface BaganCacheConfig {
    * [`LiquidObject`](crate::LiquidObject) values. Entries outside the
    * entry directory are rejected at construction.
    */
-  liquidCollections?: Array<string>;
+  liquidCollections?: Array<string>
 }
 
 /**
@@ -342,58 +345,65 @@ export interface BaganCacheJsOptions {
    * the theme directories below are then resolved from the entry
    * directory.
    */
-  theme?: string;
+  theme?: string
   /**
    * Local layouts directory (local mode only), relative to the entry
    * directory. Defaults to `_layouts`.
    */
-  themeLayoutsDir?: string;
+  themeLayoutsDir?: string
   /**
    * Local includes directory (local mode only), relative to the entry
    * directory. Defaults to `_includes`.
    */
-  themeIncludesDir?: string;
+  themeIncludesDir?: string
   /**
    * Local theme assets directory (local mode only), relative to the
    * entry directory. Defaults to `_assets`.
    */
-  themeAssetsDir?: string;
+  themeAssetsDir?: string
   /**
    * Local data directory (local mode only), relative to the entry
    * directory. Defaults to `_data`.
    */
-  themeDataDir?: string;
+  themeDataDir?: string
   /**
    * Theme configuration object (`themeConfigObject`). When omitted
    * (and `theme` is set) it is loaded automatically from the theme
    * package's default export.
    */
-  themeConfig?: BaganThemeConfig;
+  themeConfig?: BaganThemeConfig
   /** Markdown parsing/rendering options (`fragment`, GFM, …). */
-  markdown?: PeisarOptions;
+  markdown?: PeisarOptions
   /** Disk-archive thresholds (shard size / flush interval). */
-  archive?: ArchiveConfig;
+  archive?: ArchiveConfig
   /** Static-hosting baseUrl resolution. */
-  hosting?: HostingConfig;
+  hosting?: HostingConfig
   /** Build output directory. */
-  outDir?: string;
+  outDir?: string
   /** Disk-archive directory. */
-  cacheDir?: string;
+  cacheDir?: string
   /**
    * Liquid (`.html`) collections inside the entry directory: each
    * entry is a directory (flattened recursively) or a single file,
    * resolved against the entry directory. The discovered files are
    * cached as text, watched, and exposed through `cache.liquids()`.
    */
-  liquidCollections?: Array<string>;
+  liquidCollections?: Array<string>
   /**
-   * JavaScript function that renders a Liquid template to HTML
-   * (`liquidRender(file: string) => string`). Invoked on the JS main
+   * JavaScript function that renders a Liquid collection file to a
+   * page (`liquidRender(file: string) => PageObject`). The
+   * callback extracts the YAML front matter from the raw file,
+   * renders the Liquid content to HTML, and returns the page fields
+   * (the object is converted leniently — `html` is the meaningful
+   * field, anything else falls back to the raw front matter); the
+   * cache fills the path-derived fields (fileName, slug,
+   * outFilePath, inputFilePath) and `raw`. Invoked on the JS main
    * thread when liquid objects are built; a callback that throws or
-   * returns a non-string leaves the `html` field empty. Registerable
-   * later with `useLiquidRender()` as well.
+   * returns nothing leaves the front-matter fields empty and `html`
+   * as the raw template. Registerable later with `useLiquidRender()`
+   * as well.
    */
-  liquidRender?: (file: string) => string;
+  liquidRender?: (file: string) => PageObject
 }
 
 /**
@@ -407,31 +417,31 @@ export interface BaganCacheJsOptions {
  */
 export interface BaganThemeConfig {
   /** Theme package name. */
-  name?: string;
+  name?: string
   /** Theme package version. */
-  version?: string;
+  version?: string
   /** Optional theme author. */
-  author?: string;
+  author?: string
   /**
    * Relative path to the theme's HTML layout templates (default
    * `"_layouts"`), resolved against the theme root.
    */
-  layoutsDir?: string;
+  layoutsDir?: string
   /**
    * Relative path to the theme's include templates (default
    * `"_includes"`), resolved against the theme root.
    */
-  includesDir?: string;
+  includesDir?: string
   /**
    * Relative path to the theme's static assets (default `"_assets"`),
    * resolved against the theme root.
    */
-  assetsDir?: string;
+  assetsDir?: string
   /**
    * Relative path to the theme's data files (default `"_data"`),
    * resolved against the theme root.
    */
-  dataDir?: string;
+  dataDir?: string
 }
 
 /**
@@ -440,19 +450,19 @@ export interface BaganThemeConfig {
  */
 export interface BaseDirInfo {
   /** Hosting provider in effect. */
-  provider: BaganHostingProvider;
+  provider: BaganHostingProvider
   /** Repository name (GitHub Pages project sites): `/<repo>/` prefix. */
-  repo?: string;
+  repo?: string
   /**
    * Custom site URL (`https://example.com` or `https://user.github.io/repo`).
    * Used verbatim as the URL root for [`Self::site_url`].
    */
-  siteUrl?: string;
+  siteUrl?: string
   /**
    * Extra path prefix under the host (e.g. `subpath` for
    * `example.com/subpath/`).
    */
-  pathPrefix?: string;
+  pathPrefix?: string
 }
 
 /**
@@ -461,11 +471,11 @@ export interface BaseDirInfo {
  */
 export interface CacheChangeEvent {
   /** Absolute path of the changed file. */
-  path: string;
+  path: string
   /** `"create"`, `"modify"`, `"remove"`, or `"other"`. */
-  kind: string;
+  kind: string
   /** `true` when the file is under the markdown entry directory. */
-  isMarkdown: boolean;
+  isMarkdown: boolean
 }
 
 /**
@@ -475,48 +485,74 @@ export interface CacheChangeEvent {
  * bincode round-trip through the disk archive.
  */
 export type CachedContent =
-  | { type: "Text"; field0: string }
-  | { type: "Binary"; field0: Array<number> };
+  | { type: 'Text'; field0: string }
+  | { type: 'Binary'; field0: Array<number> }
 
 /** Static-hosting configuration for baseUrl resolution. */
 export interface HostingConfig {
   /** Hosting provider (see [`HostingProvider`]). */
-  provider?: BaganHostingProvider;
+  provider?: BaganHostingProvider
   /** GitHub repository name for project pages (`/<repo>/` prefix). */
-  repo?: string;
+  repo?: string
   /** Custom site URL (overrides provider defaults when set). */
-  siteUrl?: string;
+  siteUrl?: string
   /** Extra path prefix (e.g. `"subpath"` for `example.com/subpath/`). */
-  pathPrefix?: string;
+  pathPrefix?: string
 }
 
 /**
  * A Liquid (`.html`) template tracked through one of the configured
- * `liquidCollections` directories/files, rendered to HTML on the JS side
- * through the `liquidRender(file)` callback.
+ * `liquidCollections` directories/files. The template carries YAML front
+ * matter like a markdown file; the JS-side `liquidRender(file)` callback
+ * extracts the front matter, renders the Liquid content to HTML, and
+ * returns the front-matter fields, so the object shares the
+ * [`PageObject`] shape with markdown pages.
+ *
+ * Front-matter-derived fields (`layout`, `title`, `summary`, `tags`,
+ * `publishDate`, `extra`) come from the callback's returned object
+ * (falling back to the raw front matter when no callback is
+ * configured); path-derived fields (`fileName`, `slug`, `outFilePath`,
+ * `inputFilePath`) are computed by the cache.
  */
 export interface LiquidObject {
+  /**
+   * Layout name from front matter (e.g. `default`, `page`, `post`);
+   * `"default"` when front matter does not set one.
+   */
+  layout: string
   /** File name without extension (`foo.html` → `foo`). */
-  fileName: string;
+  fileName: string
   /**
    * Request URL for the rendered file (`docs/foo.html` → `/docs/foo`);
    * the `html` extension is stripped and the resolved baseUrl is
    * prefixed.
    */
-  slug: string;
-  /** Raw Liquid template content (UTF-8 text). */
-  raw: string;
+  slug: string
+  /** Raw file content (front matter + Liquid template, UTF-8 text). */
+  raw: string
   /**
-   * HTML rendered from the template by the JS-side `liquidRender`
-   * callback. Empty when no callback is configured.
+   * HTML rendered from the Liquid content by the JS-side
+   * `liquidRender(file)` callback. Empty when no callback is
+   * configured.
    */
-  html: string;
+  html: string
   /** Build output path (`path/to/foo.html` → `outDir/path/to/foo.html`). */
-  outFilePath: string;
+  outFilePath: string
   /** Original absolute source path (watch-process identity). */
-  inputFilePath: string;
-  /** File extension (lowercase, without dot). */
-  ext: string;
+  inputFilePath: string
+  /** Page title from front matter. */
+  title?: string
+  /** Short description from front matter. */
+  summary?: string
+  /** Category tags from front matter. */
+  tags?: Array<string>
+  /** Publication date from front matter (string form `yyyy-mm-dd`). */
+  publishDate?: string
+  /**
+   * Any extra front-matter keys not mapped to a named field, exposed
+   * verbatim (as strings) so themes can render `{{ page.custom }}`.
+   */
+  extra?: Record<string, string>
 }
 
 /** LRU budgets for the memory tier. */
@@ -526,9 +562,9 @@ export interface MemoryConfig {
    * unlimited). When the budget is exceeded, the least recently used
    * entries are evicted (they remain readable from the disk archive).
    */
-  byteBudget?: number;
+  byteBudget?: number
   /** Maximum number of entries in memory (`0` = unlimited). */
-  entryBudget?: number;
+  entryBudget?: number
 }
 
 /**
@@ -540,48 +576,48 @@ export interface PageObject {
    * Layout name from front matter (e.g. `default`, `page`, `post`);
    * `"default"` when front matter does not set one.
    */
-  layout: string;
+  layout: string
   /**
    * File name without extension (`foo.md` → `foo`); `index` for
    * directory roots. Used as a search / lookup key.
    */
-  fileName: string;
+  fileName: string
   /** Request URL for the page (`path/to/foo.md` → `/path/to/foo`). */
-  slug: string;
+  slug: string
   /** HTML rendered from the markdown by Peisar. */
-  html: string;
+  html: string
   /**
    * Build output path (`path/to/foo.md` → `outDir/path/to/foo/index.html`),
    * relative to the output root unless absolute.
    */
-  outFilePath: string;
+  outFilePath: string
   /** Original absolute source path (watch-process identity). */
-  inputFilePath: string;
+  inputFilePath: string
   /** Page title (from front matter, or the first `#` heading). */
-  title?: string;
+  title?: string
   /** Short description from front matter. */
-  summary?: string;
+  summary?: string
   /** Category tags from front matter. */
-  tags?: Array<string>;
+  tags?: Array<string>
   /** Publication date from front matter (string form `yyyy-mm-dd`). */
-  publishDate?: string;
+  publishDate?: string
   /**
    * Any extra front-matter keys not mapped to a named field, exposed
    * verbatim (as strings) so themes can render `{{ page.custom }}`.
    */
-  extra?: Record<string, string>;
+  extra?: Record<string, string>
 }
 
 /** Resolved theme directories, as absolute paths. */
 export interface ThemeDirs {
   /** Directory containing the theme's HTML layout templates. */
-  layoutsDir: string;
+  layoutsDir: string
   /** Directory containing the theme's static assets. */
-  assetsDir: string;
+  assetsDir: string
   /** Directory containing the theme's data files. */
-  dataDir: string;
+  dataDir: string
   /** Directory containing the theme's HTML includes files. */
-  includesDir: string;
+  includesDir: string
 }
 
 /**
@@ -599,14 +635,14 @@ export declare class Peisar {
    * When `options` is omitted, GFM and Kramdown parsing are enabled and
    * `html` returns a complete HTML document.
    */
-  constructor(rawMd: string, options?: PeisarOptions | undefined | null);
+  constructor(rawMd: string, options?: PeisarOptions | undefined | null)
   /**
    * Gets the parsed Markdown document as a JavaScript AST object.
    *
    * Registered visitors run before the AST is returned. The returned value
    * is a clone, so reading this property does not consume the parser state.
    */
-  get ast(): Document;
+  get ast(): Document
   /**
    * Registers a unified JavaScript plugin.
    *
@@ -615,21 +651,21 @@ export declare class Peisar {
    * Visitor callbacks receive their node as a one-item tuple: for example,
    * `visitBlock([block]) { return { recurse: true }; }`.
    */
-  use(plugin: Plugin): void;
+  use(plugin: Plugin): void
   /**
    * Renders the parsed Markdown as HTML using the configured render options.
    *
    * Registered visitors run before rendering.
    */
-  get html(): string;
+  get html(): string
   /** Gets the deserialized YAML front matter, or `null` when none exists. */
-  get frontmatter(): any | null;
+  get frontmatter(): any | null
   /**
    * Gets the parsed Markdown AST serialized as JSON.
    *
    * Registered visitors run before serialization.
    */
-  get astJson(): string;
+  get astJson(): string
 }
 
 /**
@@ -655,52 +691,49 @@ export interface PeisarOptions {
    * Enable GitHub Flavored Markdown (tables, strikethrough, task lists,
    * autolinks).  Default: `true`.
    */
-  gfm?: boolean;
+  gfm?: boolean
   /**
    * Enable Kramdown-style block attributes (`{:#id .class key="val"}`).
    * Default: `true`.
    */
-  kramdown?: boolean;
+  kramdown?: boolean
   /** Optional file name to attach to the parsed document. */
-  fileName?: string;
+  fileName?: string
   /**
    * If `true`, emit only the body content (no `<!DOCTYPE>`, `<html>`,
    * `<head>`, or `<body>` wrapper).  If `false`, emit a full HTML
    * document.  Default: `true` (fragment).
    */
-  fragment?: boolean;
+  fragment?: boolean
   /**
    * Include a `<meta charset="utf-8">` in the head (only relevant when
    * `fragment` is `false`).  Default: `true`.
    */
-  charset?: boolean;
+  charset?: boolean
   /**
    * Include a `<meta name="viewport" content="width=device-width,
    * initial-scale=1.0">` in the head (only relevant when `fragment` is
    * `false`).  Default: `true`.
    */
-  viewport?: boolean;
+  viewport?: boolean
   /**
    * Optional `<title>` for the HTML head (only relevant when
    * `fragment` is `false`).  Default: `None`.
    */
-  title?: string;
+  title?: string
   /**
    * Optional additional CSS classes to add to `<body>` (only relevant
    * when `fragment` is `false`).  Default: `None`.
    */
-  bodyClass?: string;
+  bodyClass?: string
   /**
    * Optional inline CSS to inject in a `<style>` tag in the head.
    * Default: `None`.
    */
-  style?: string;
+  style?: string
 }
 
-export declare function renderDocumentHtml(
-  doc: Document,
-  opts?: RenderOptions | undefined | null,
-): string;
+export declare function renderDocumentHtml(doc: Document, opts?: RenderOptions | undefined | null): string
 
 /** Options that control how the AST is rendered to HTML. */
 export interface RenderOptions {
@@ -709,33 +742,33 @@ export interface RenderOptions {
    * `<head>`, or `<body>` wrapper).  If `false`, emit a full HTML
    * document.  Default: `true` (fragment).
    */
-  fragment: boolean;
+  fragment: boolean
   /**
    * Include a `<meta charset="utf-8">` in the head (only relevant when
    * `fragment` is `false`).  Default: `true`.
    */
-  charset: boolean;
+  charset: boolean
   /**
    * Include a `<meta name="viewport" content="width=device-width,
    * initial-scale=1.0">` in the head (only relevant when `fragment` is
    * `false`).  Default: `true`.
    */
-  viewport: boolean;
+  viewport: boolean
   /**
    * Optional `<title>` for the HTML head (only relevant when
    * `fragment` is `false`).  Default: `None`.
    */
-  title?: string;
+  title?: string
   /**
    * Optional additional CSS classes to add to `<body>` (only relevant
    * when `fragment` is `false`).  Default: `None`.
    */
-  bodyClass?: string;
+  bodyClass?: string
   /**
    * Optional inline CSS to inject in a `<style>` tag in the head.
    * Default: `None`.
    */
-  style?: string;
+  style?: string
 }
 
 /**
@@ -757,110 +790,93 @@ export interface AstOptions {
    * Enable GitHub Flavored Markdown (tables, strikethrough, task lists,
    * autolinks).  Default: `true`.
    */
-  gfm: boolean;
+  gfm: boolean
   /**
    * Enable Kramdown-style block attributes (`{:#id .class key="val"}`).
    * Default: `true`.
    */
-  kramdown: boolean;
+  kramdown: boolean
   /**
    * Optional file name to attach to the parsed
    * [`Document`](crate::Document).
    */
-  fileName?: string;
+  fileName?: string
 }
 
 /** Parsed Kramdown block attributes (`{:#id .class key="val"}`). */
 export interface Attributes {
   /** HTML `id` attribute. */
-  id?: string;
+  id?: string
   /** CSS class list. */
-  classes?: Array<string>;
+  classes?: Array<string>
   /** Arbitrary key/value attributes. */
-  attributes?: Array<[string, string]>;
+  attributes?: Array<[string, string]>
 }
 
 /** Block-level nodes. */
 export type Block =
-  | {
-      type: "Heading" /** Heading level (1–6). */;
-      level: number /** Inline content of the heading. */;
-      children: Array<Inline> /** Source span. */;
-      pos: Span /** Optional Kramdown attributes. */;
-      attrs?: Attributes;
-    }
-  | {
-      type: "Paragraph" /** Inline content of the paragraph. */;
-      children: Array<Inline> /** Source span. */;
-      pos: Span /** Optional Kramdown attributes. */;
-      attrs?: Attributes;
-    }
-  | {
-      type: "CodeBlock" /** Language hint from the info string (e.g. `rust` from ` ```rust `). */;
-      lang?: string /** The raw code content. */;
-      code: string /** Source span. */;
-      pos: Span /** Optional Kramdown attributes. */;
-      attrs?: Attributes;
-    }
-  | {
-      type: "BlockQuote" /** Nested block content inside the quote. */;
-      children: Array<Block> /** Source span. */;
-      pos: Span /** Optional Kramdown attributes. */;
-      attrs?: Attributes;
-    }
-  | {
-      type: "List" /** `true` for ordered lists, `false` for unordered. */;
-      ordered: boolean /** The list items. */;
-      items: Array<ListItem> /** Source span. */;
-      pos: Span /** Optional Kramdown attributes. */;
-      attrs?: Attributes;
-    }
-  | { type: "ThematicBreak" /** Source span. */; pos: Span }
-  | {
-      type: "HtmlBlock" /** The raw HTML content. */;
-      html: string /** Source span. */;
-      pos: Span /** Optional Kramdown attributes. */;
-      attrs?: Attributes;
-    }
-  | {
-      type: "Table" /** The table structure (header, rows, alignments). */;
-      table: Table /** Source span. */;
-      pos: Span /** Optional Kramdown attributes. */;
-      attrs?: Attributes;
-    }
-  | {
-      type: "LinkReferenceDefinition" /** Normalized label (lowercased, trimmed). */;
-      label: string /** The destination URL. */;
-      url: string /** Optional link title. */;
-      title?: string /** Source span. */;
-      pos: Span;
-    }
-  | {
-      type: "Comment" /** The comment text (markers stripped). */;
-      value: string /** Source span. */;
-      pos: Span;
-    };
+  | { type: 'Heading'; /** Heading level (1–6). */
+    level: number; /** Inline content of the heading. */
+    children: Array<Inline>; /** Source span. */
+    pos: Span; /** Optional Kramdown attributes. */
+  attrs?: Attributes }
+  | { type: 'Paragraph'; /** Inline content of the paragraph. */
+    children: Array<Inline>; /** Source span. */
+    pos: Span; /** Optional Kramdown attributes. */
+  attrs?: Attributes }
+  | { type: 'CodeBlock'; /** Language hint from the info string (e.g. `rust` from ` ```rust `). */
+    lang?: string; /** The raw code content. */
+    code: string; /** Source span. */
+    pos: Span; /** Optional Kramdown attributes. */
+  attrs?: Attributes }
+  | { type: 'BlockQuote'; /** Nested block content inside the quote. */
+    children: Array<Block>; /** Source span. */
+    pos: Span; /** Optional Kramdown attributes. */
+  attrs?: Attributes }
+  | { type: 'List'; /** `true` for ordered lists, `false` for unordered. */
+    ordered: boolean; /** The list items. */
+    items: Array<ListItem>; /** Source span. */
+    pos: Span; /** Optional Kramdown attributes. */
+  attrs?: Attributes }
+  | { type: 'ThematicBreak'; /** Source span. */
+  pos: Span }
+  | { type: 'HtmlBlock'; /** The raw HTML content. */
+    html: string; /** Source span. */
+    pos: Span; /** Optional Kramdown attributes. */
+  attrs?: Attributes }
+  | { type: 'Table'; /** The table structure (header, rows, alignments). */
+    table: Table; /** Source span. */
+    pos: Span; /** Optional Kramdown attributes. */
+  attrs?: Attributes }
+  | { type: 'LinkReferenceDefinition'; /** Normalized label (lowercased, trimmed). */
+    label: string; /** The destination URL. */
+    url: string; /** Optional link title. */
+    title?: string; /** Source span. */
+  pos: Span }
+  | { type: 'Comment'; /** The comment text (markers stripped). */
+    value: string; /** Source span. */
+  pos: Span }
 
 /**
  * Synchronous block-visitor callback. Receives a `Block`, returns
  * `VisitControlJs` (or `undefined` for no changes).
  */
-export type BlockCallback = (arg: [Block]) => VisitorControl | null;
+export type BlockCallback = (arg: [Block]) => VisitorControl | null
 
 /**
  * Synchronous block parser hook. Receives a [`BlockParserContext`], returns
  * a [`BlockParseResultJs`] (or `undefined` to decline).
  */
-export type BlockParseCallback = (arg: [BlockParserContext]) => BlockParseResult | null;
+export type BlockParseCallback = (arg: [BlockParserContext]) => BlockParseResult | null
 
 /** Context passed to block parser hooks. */
 export interface BlockParserContext {
   /** The current (unmodified) source line. */
-  line: string;
+  line: string
   /** 0-based index of the current line in the (sub-)document. */
-  lineIndex: number;
+  lineIndex: number
   /** Remaining lines starting at the current line (`lines[0]` is `line`). */
-  lines: Array<string>;
+  lines: Array<string>
 }
 
 /**
@@ -871,9 +887,9 @@ export interface BlockParserContext {
  */
 export interface BlockParseResult {
   /** The parsed block node. */
-  block?: Block;
+  block?: Block
   /** Number of source lines consumed (must be at least `1`). */
-  consumed?: number;
+  consumed?: number
 }
 
 /**
@@ -884,70 +900,68 @@ export interface BlockParseResult {
  */
 export interface Document {
   /** Always `"root"`. */
-  nodeType: string;
+  nodeType: string
   /** Optional source file name. */
-  fileName?: string;
+  fileName?: string
   /** Span of the whole document in the source text. */
-  pos: Span;
+  pos: Span
   /** Top-level block children. */
-  children: Array<Block>;
+  children: Array<Block>
   /** All link reference definitions collected from the document. */
-  linkReferences: Array<LinkReferenceDefinition>;
+  linkReferences: Array<LinkReferenceDefinition>
 }
 
 /** Inline-level nodes. */
 export type Inline =
-  | { type: "Text" /** The text value. */; value: string /** Source span. */; pos: Span }
-  | {
-      type: "Emphasis" /** Emphasis level (italic or bold). */;
-      level: PeisarEmphasisLevel /** Nested inline content. */;
-      children: Array<Inline> /** Source span. */;
-      pos: Span;
-    }
-  | { type: "Code" /** The code text. */; code: string /** Source span. */; pos: Span }
-  | { type: "HtmlInline" /** The raw HTML string. */; html: string /** Source span. */; pos: Span }
-  | {
-      type: "Strikethrough" /** Nested inline content. */;
-      children: Array<Inline> /** Source span. */;
-      pos: Span;
-    }
-  | { type: "HardBreak" /** Source span. */; pos: Span }
-  | { type: "SoftBreak" /** Source span. */; pos: Span }
-  | {
-      type: "Image" /** Alternative text. */;
-      alt: string /** Image URL. */;
-      url: string /** Optional title. */;
-      title?: string /** Source span. */;
-      pos: Span;
-    }
-  | {
-      type: "Link" /** Link text (inline children). */;
-      text: Array<Inline> /** Destination URL. */;
-      url: string /** Optional link title. */;
-      title?: string /** `true` if this is a GFM autolink (bare URL). */;
-      autolink: boolean /** Source span. */;
-      pos: Span;
-    }
-  | {
-      type: "LinkReference" /** Link text (inline children). */;
-      text: Array<Inline> /** Normalized label used to look up the reference. */;
-      label: string /** Resolved destination URL. */;
-      url: string /** Optional resolved title. */;
-      title?: string /** Source span. */;
-      pos: Span;
-    };
+  | { type: 'Text'; /** The text value. */
+    value: string; /** Source span. */
+  pos: Span }
+  | { type: 'Emphasis'; /** Emphasis level (italic or bold). */
+    level: PeisarEmphasisLevel; /** Nested inline content. */
+    children: Array<Inline>; /** Source span. */
+  pos: Span }
+  | { type: 'Code'; /** The code text. */
+    code: string; /** Source span. */
+  pos: Span }
+  | { type: 'HtmlInline'; /** The raw HTML string. */
+    html: string; /** Source span. */
+  pos: Span }
+  | { type: 'Strikethrough'; /** Nested inline content. */
+    children: Array<Inline>; /** Source span. */
+  pos: Span }
+  | { type: 'HardBreak'; /** Source span. */
+  pos: Span }
+  | { type: 'SoftBreak'; /** Source span. */
+  pos: Span }
+  | { type: 'Image'; /** Alternative text. */
+    alt: string; /** Image URL. */
+    url: string; /** Optional title. */
+    title?: string; /** Source span. */
+  pos: Span }
+  | { type: 'Link'; /** Link text (inline children). */
+    text: Array<Inline>; /** Destination URL. */
+    url: string; /** Optional link title. */
+    title?: string; /** `true` if this is a GFM autolink (bare URL). */
+    autolink: boolean; /** Source span. */
+  pos: Span }
+  | { type: 'LinkReference'; /** Link text (inline children). */
+    text: Array<Inline>; /** Normalized label used to look up the reference. */
+    label: string; /** Resolved destination URL. */
+    url: string; /** Optional resolved title. */
+    title?: string; /** Source span. */
+  pos: Span }
 
 /**
  * Synchronous inline-visitor callback. Receives an `Inline`, returns
  * `InlineVisitControlJs` (or `undefined` for no changes).
  */
-export type InlineCallback = (arg: [Inline]) => InlineVisitorControl | null;
+export type InlineCallback = (arg: [Inline]) => InlineVisitorControl | null
 
 /**
  * Synchronous inline parser hook. Receives an [`InlineParserContext`],
  * returns an [`InlineParseResultJs`] (or `undefined` to decline).
  */
-export type InlineParseCallback = (arg: [InlineParserContext]) => InlineParseResult | null;
+export type InlineParseCallback = (arg: [InlineParserContext]) => InlineParseResult | null
 
 /**
  * Context passed to inline parser hooks.
@@ -956,9 +970,9 @@ export type InlineParseCallback = (arg: [InlineParserContext]) => InlineParseRes
  */
 export interface InlineParserContext {
   /** Remaining inline text starting at the current character position. */
-  rest: string;
+  rest: string
   /** 0-based character index of the current position in the inline text. */
-  index: number;
+  index: number
 }
 
 /**
@@ -969,9 +983,9 @@ export interface InlineParserContext {
  */
 export interface InlineParseResult {
   /** The parsed inline node. */
-  inline?: Inline;
+  inline?: Inline
   /** Number of characters consumed (`0` or missing declines). */
-  consumed?: number;
+  consumed?: number
 }
 
 /**
@@ -982,37 +996,37 @@ export interface InlineParseResult {
  */
 export interface InlineVisitorControl {
   /** Nodes to insert before the current node. */
-  insertBefore?: Array<Inline>;
+  insertBefore?: Array<Inline>
   /** Nodes to insert after the current node. */
-  insertAfter?: Array<Inline>;
+  insertAfter?: Array<Inline>
   /** Replace the current node with these nodes. */
-  replaceWith?: Array<Inline>;
+  replaceWith?: Array<Inline>
   /** Remove the current node entirely. */
-  remove?: boolean;
+  remove?: boolean
   /** Whether to recurse into this node's children. */
-  recurse?: boolean;
+  recurse?: boolean
 }
 
 /** A link reference definition collected at the document level. */
 export interface LinkReferenceDefinition {
   /** Normalized label (lowercased, trimmed). */
-  label: string;
+  label: string
   /** The destination URL. */
-  url: string;
+  url: string
   /** Optional link title. */
-  title?: string;
+  title?: string
   /** Source span. */
-  pos: Span;
+  pos: Span
 }
 
 /** A single list item (an `<li>`). Contains nested block content. */
 export interface ListItem {
   /** Nested block content of the item. */
-  children: Array<Block>;
+  children: Array<Block>
   /** GFM task-list state: `None` = not a task, `Some` = checked / unchecked. */
-  task?: PeisarTaskState;
+  task?: PeisarTaskState
   /** Span of the item in the *sub-document* of its enclosing list. */
-  pos: Span;
+  pos: Span
 }
 
 /**
@@ -1021,23 +1035,23 @@ export interface ListItem {
  */
 export interface Plugin {
   /** Optional JS callback for block nodes (JS: `visitBlock`). */
-  visitBlock?: BlockCallback;
+  visitBlock?: BlockCallback
   /** Optional JS callback for inline nodes (JS: `visitInline`). */
-  visitInline?: InlineCallback;
+  visitInline?: InlineCallback
   /** Optional JS block parser hook (JS: `parseBlock`). */
-  parseBlock?: BlockParseCallback;
+  parseBlock?: BlockParseCallback
   /** Optional JS inline parser hook (JS: `parseInline`). */
-  parseInline?: InlineParseCallback;
+  parseInline?: InlineParseCallback
 }
 
 /** A zero-based point in the source text. */
 export interface Position {
   /** Line number, 0-based. */
-  line: number;
+  line: number
   /** Column number, 0-based (in characters). */
-  column: number;
+  column: number
   /** Byte offset from the start of the input. */
-  offset: number;
+  offset: number
 }
 
 /**
@@ -1048,31 +1062,31 @@ export interface Position {
  */
 export interface Span {
   /** The start position (inclusive). */
-  start: Position;
+  start: Position
   /** The end position (exclusive). */
-  end: Position;
+  end: Position
 }
 
 /** A GFM table. */
 export interface Table {
   /** The header row. */
-  header: TableRow;
+  header: TableRow
   /** Body rows. */
-  rows: Array<TableRow>;
+  rows: Array<TableRow>
   /** Column alignment specifications (one per column). */
-  alignments: PeisarTableCellAlignments;
+  alignments: PeisarTableCellAlignments
 }
 
 /** A single table cell. */
 export interface TableCell {
   /** Inline content of the cell. */
-  children: Array<Inline>;
+  children: Array<Inline>
 }
 
 /** A single table row (header or body). */
 export interface TableRow {
   /** The cells in this row. */
-  cells: Array<TableCell>;
+  cells: Array<TableCell>
 }
 
 /**
@@ -1083,15 +1097,15 @@ export interface TableRow {
  */
 export interface VisitorControl {
   /** Nodes to insert before the current node. */
-  insertBefore?: Array<Block>;
+  insertBefore?: Array<Block>
   /** Nodes to insert after the current node. */
-  insertAfter?: Array<Block>;
+  insertAfter?: Array<Block>
   /** Replace the current node with these nodes. */
-  replaceWith?: Array<Block>;
+  replaceWith?: Array<Block>
   /** Remove the current node entirely. */
-  remove?: boolean;
+  remove?: boolean
   /** Whether to recurse into this node's children. */
-  recurse?: boolean;
+  recurse?: boolean
 }
 
 /**
@@ -1099,13 +1113,13 @@ export interface VisitorControl {
  *
  * Returns an N-API error if the front matter is present but invalid.
  */
-export declare function frontmatter(content: string): FrontmatterResult;
+export declare function frontmatter(content: string): FrontmatterResult
 
 export interface FrontmatterResult {
   /** Clean content after the leading YAML front matter is removed. */
-  cleanContent: string;
+  cleanContent: string
   /** Deserialized YAML front matter, or `null` when no front matter exists. */
-  yamlData?: Record<string, any>;
+  yamlData?: Record<string, any>
 }
 
 /**
@@ -1116,7 +1130,7 @@ export interface FrontmatterResult {
  * read failures panic in this N-API wrapper; parse failures are returned as
  * N-API errors.
  */
-export declare function loadYaml(filePath: string): Record<string, any>;
+export declare function loadYaml(filePath: string): Record<string, any>
 
 /**
  * Parses a YAML document into a JSON-compatible value.
@@ -1126,4 +1140,4 @@ export declare function loadYaml(filePath: string): Record<string, any>;
  *
  * Returns an N-API error if the YAML input cannot be parsed.
  */
-export declare function yamlParser(yamlStr: string): Record<string, any>;
+export declare function yamlParser(yamlStr: string): Record<string, any>

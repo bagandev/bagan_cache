@@ -75,29 +75,52 @@ pub struct AssetsObject {
 }
 
 /// A Liquid (`.html`) template tracked through one of the configured
-/// `liquidCollections` directories/files, rendered to HTML on the JS side
-/// through the `liquidRender(file)` callback.
+/// `liquidCollections` directories/files. The template carries YAML front
+/// matter like a markdown file; the JS-side `liquidRender(file)` callback
+/// extracts the front matter, renders the Liquid content to HTML, and
+/// returns the front-matter fields, so the object shares the
+/// [`PageObject`] shape with markdown pages.
+///
+/// Front-matter-derived fields (`layout`, `title`, `summary`, `tags`,
+/// `publishDate`, `extra`) come from the callback's returned object
+/// (falling back to the raw front matter when no callback is
+/// configured); path-derived fields (`fileName`, `slug`, `outFilePath`,
+/// `inputFilePath`) are computed by the cache.
 #[cfg_attr(feature = "npm", napi(object))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiquidObject {
+    /// Layout name from front matter (e.g. `default`, `page`, `post`);
+    /// `"default"` when front matter does not set one.
+    pub layout: String,
     /// File name without extension (`foo.html` → `foo`).
     pub file_name: String,
     /// Request URL for the rendered file (`docs/foo.html` → `/docs/foo`);
     /// the `html` extension is stripped and the resolved baseUrl is
     /// prefixed.
     pub slug: String,
-    /// Raw Liquid template content (UTF-8 text).
+    /// Raw file content (front matter + Liquid template, UTF-8 text).
     pub raw: String,
-    /// HTML rendered from the template by the JS-side `liquidRender`
-    /// callback. Empty when no callback is configured.
+    /// HTML rendered from the Liquid content by the JS-side
+    /// `liquidRender(file)` callback. Empty when no callback is
+    /// configured.
     pub html: String,
     /// Build output path (`path/to/foo.html` → `outDir/path/to/foo.html`).
     pub out_file_path: String,
     /// Original absolute source path (watch-process identity).
     pub input_file_path: String,
-    /// File extension (lowercase, without dot).
-    pub ext: String,
+    /// Page title from front matter.
+    pub title: Option<String>,
+    /// Short description from front matter.
+    pub summary: Option<String>,
+    /// Category tags from front matter.
+    pub tags: Option<Vec<String>>,
+    /// Publication date from front matter (string form `yyyy-mm-dd`).
+    pub publish_date: Option<String>,
+    /// Any extra front-matter keys not mapped to a named field, exposed
+    /// verbatim (as strings) so themes can render `{{ page.custom }}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra: Option<HashMap<String, String>>,
 }
 
 /// Classify an asset extension into the `fileType` buckets.

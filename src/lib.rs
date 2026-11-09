@@ -18,7 +18,7 @@
 //!   hosting: { provider: "GithubPages", repo: "site" },
 //!   outDir: "out",
 //!   liquidCollections: ["_pages", "about.html"],
-//!   liquidRender: (file) => renderLiquid(file), // JS-side Liquid → HTML
+//!   liquidRender: (file) => renderLiquid(file), // (file) => LiquidObject
 //! });
 //! cache.pages();                    // PageObject[] — for Liquid themes
 //! cache.getPage("docs/intro.md");   // single page object (or null)
@@ -69,9 +69,11 @@
 //! - *Liquid*: `.html` / `.liquid` files inside the configured
 //!   `liquidCollections` (directories are flattened recursively, files are
 //!   taken as-is; both are resolved against the entry directory and must
-//!   live inside it). Cached as UTF-8 text; the JS-side `liquidRender(file)`
-//!   callback renders them to HTML for
-//!   [`LiquidObject`](crate::LiquidObject) values.
+//!   live inside it). The files carry YAML front matter like markdown
+//!   pages; the JS-side `liquidRender(file)` callback extracts it, renders
+//!   the Liquid content to HTML, and returns the front-matter fields, so
+//!   [`LiquidObject`](crate::LiquidObject) values share the
+//!   [`PageObject`](crate::PageObject) shape.
 //!
 //! # Tiering
 //!
@@ -151,19 +153,27 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// JS-side Liquid renderer for the configured `liquidCollections`
-/// (npm builds): a synchronous `liquidRender(file: string) => string`
-/// callback. Rendering must happen on the JS main thread — the same
-/// constraint as markdown visitor plugins — so the callback is stored as
-/// a `FunctionRef` and borrowed at render time (see
+/// (npm builds): a synchronous `liquidRender(file: string) =>
+/// PageObject` callback. The JS side extracts the YAML front matter,
+/// renders the Liquid content to HTML, and returns the page fields; the
+/// cache keeps its own path-derived fields (fileName, slug,
+/// outFilePath, inputFilePath) and `raw`. The callback result is
+/// converted leniently (via `serde_json::Value`) so JS consumers may
+/// return a partial object — `html` is the only required behavior,
+/// anything else falls back to the raw front matter. Rendering must
+/// happen on the JS main thread — the same constraint as markdown
+/// visitor plugins — so the callback is stored as a `FunctionRef` and
+/// borrowed at render time (see
 /// [`RegisteredPlugin`](peisar::plugin::RegisteredPlugin) for the same
 /// pattern).
 #[cfg(feature = "npm")]
-pub type LiquidRenderer = FunctionRef<String, String>;
+pub type LiquidRenderer = FunctionRef<String, serde_json::Value>;
 
 /// Rust-side Liquid renderer for the configured `liquidCollections`
-/// (non-npm builds): takes the raw template text and returns HTML.
+/// (non-npm builds): takes the raw file text and returns the
+/// front-matter fields + rendered HTML as a [`LiquidObject`].
 #[cfg(not(feature = "npm"))]
-pub type LiquidRenderer = Box<dyn Fn(String) -> String + Send + Sync + 'static>;
+pub type LiquidRenderer = Box<dyn Fn(String) -> LiquidObject + Send + Sync + 'static>;
 
 /// ANSI color escape sequences for the watcher's pretty logs (disabled
 /// automatically when stderr is not an interactive terminal).
@@ -552,9 +562,10 @@ pub struct BaganCache {
     /// directories/files from `liquidCollections`), used to re-flatten
     /// after directory-level events. Clone-shared with the watcher thread.
     liquid_collection_roots: Arc<Mutex<Vec<PathBuf>>>,
-    /// JS-side `liquidRender(file)` callback for LiquidObject.html (npm
-    /// builds hold a `FunctionRef` + the napi `Env` captured at
-    /// construction; rendering runs on the JS main thread only).
+    /// JS-side `liquidRender(file)` callback for LiquidObject values
+    /// (npm builds hold a `FunctionRef` + the napi `Env` captured at
+    /// construction; rendering runs on the JS main thread only). The
+    /// callback returns the front-matter fields + rendered HTML.
     #[cfg(feature = "npm")]
     liquid_renderer: Option<LiquidRenderer>,
     /// Rust-side Liquid renderer (non-npm builds).
@@ -924,8 +935,8 @@ impl BaganCache {
     /// memory tier; disk writes happen later on the archive worker's
     /// size/interval flush (or explicitly via [`Self::flush`]). Liquid
     /// collections are resolved and loaded, but without a renderer the
-    /// `LiquidObject.html` field stays empty (Rust consumers can use
-    /// [`Self::use_liquid_render`]).
+    /// front-matter fields come from the raw front matter and `html`
+    /// stays empty (Rust consumers can use [`Self::use_liquid_render`]).
     pub fn with_config(config: BaganCacheConfig) -> io::Result<Self> {
         #[cfg(feature = "npm")]
         {
@@ -938,8 +949,9 @@ impl BaganCache {
     }
 
     /// [`Self::with_config`] with an optional Liquid renderer: the JS
-    /// `liquidRender(file)` callback (npm builds) or a boxed Rust closure
-    /// (non-npm builds), invoked when `LiquidObject` values are built.
+    /// `liquidRender(file) => LiquidObject` callback (npm builds) or a
+    /// boxed Rust closure (non-npm builds), invoked when `LiquidObject`
+    /// values are built.
     pub fn with_config_liquid(
         config: BaganCacheConfig,
         liquid_renderer: Option<LiquidRenderer>,
@@ -1260,18 +1272,28 @@ impl BaganCache {
     }
 
     /// JS: `cache.useLiquidRender(cb)` — register the JavaScript function
-    /// that renders a Liquid template to HTML
-    /// (`liquidRender(file: string) => string`). Called on the JS main
-    /// thread every time `liquids()` / `getLiquid()` builds a
-    /// [`LiquidObject`]; a callback that throws or returns a non-string
-    /// leaves `html` empty. Also accepts the callback through the
-    /// constructor option `liquidRender`.
+    /// that renders a Liquid collection file to a page
+    /// (`liquidRender(file: string) => PageObject`). The callback
+    /// extracts the front matter, renders the Liquid content to HTML,
+    /// and returns the page fields (converted leniently — `html` is the
+    /// meaningful field, anything else falls back to the raw front
+    /// matter); the cache fills the path-derived fields (fileName,
+    /// slug, outFilePath, inputFilePath) and `raw` itself. Called on
+    /// the JS main thread every time `liquids()` / `getLiquid()` builds
+    /// a [`LiquidObject`]; a callback that throws or returns nothing
+    /// leaves the front-matter fields empty and `html` as the raw
+    /// template. Also accepts the callback through the constructor
+    /// option `liquidRender`.
     #[cfg(feature = "npm")]
     #[napi]
     pub fn use_liquid_render(
         &mut self,
         env: Env,
-        #[napi(ts_arg_type = "(file: string) => string")] render: Function<'static, String, String>,
+        #[napi(ts_arg_type = "(file: string) => PageObject")] render: Function<
+            'static,
+            String,
+            serde_json::Value,
+        >,
     ) {
         // The napi env is captured here too: `withConfigJs` consumers have
         // none stored from construction, and the FunctionRef needs it to
@@ -1280,15 +1302,17 @@ impl BaganCache {
         self.liquid_renderer = render.create_ref().ok();
     }
 
-    /// Register a Rust closure that renders Liquid templates to HTML for
-    /// `liquids()` / `get_liquid()` (non-npm builds). `withConfig`
+    /// Register a Rust closure that renders Liquid collection files for
+    /// `liquids()` / `get_liquid()` (non-npm builds): it receives the
+    /// raw file text and returns the front-matter fields + rendered
+    /// HTML as a [`LiquidObject`]. `withConfig`
     /// consumers cannot pass functions through the napi config object,
     /// so this is the Rust counterpart of the constructor's
     /// `liquidRender` option.
     #[cfg(not(feature = "npm"))]
     pub fn use_liquid_render<F>(&mut self, render: F)
     where
-        F: Fn(String) -> String + Send + Sync + 'static,
+        F: Fn(String) -> LiquidObject + Send + Sync + 'static,
     {
         self.liquid_renderer = Some(Box::new(render));
     }
@@ -1848,8 +1872,9 @@ impl BaganCache {
     }
 
     /// JS: `cache.liquids()` — every liquid object for the configured
-    /// `liquidCollections`, with HTML rendered by the JS-side
-    /// `liquidRender(file)` callback.
+    /// `liquidCollections`: front-matter fields from the JS-side
+    /// `liquidRender(file)` callback (which also renders the HTML),
+    /// path-derived fields from the cache.
     #[cfg_attr(feature = "npm", napi)]
     pub fn liquids(&self) -> Vec<LiquidObject> {
         self.liquid_objects()
@@ -1881,21 +1906,76 @@ impl BaganCache {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
-        let html = self.render_liquid(&raw);
+        // Front-matter fallback: the raw liquid files carry YAML front
+        // matter like markdown pages, so fields the renderer does not
+        // provide still surface.
+        let fm = frontmatter(raw.clone())
+            .ok()
+            .and_then(|parsed| parsed.yaml_data().cloned());
+        let fm_ref = fm.as_ref();
+        let fallback_layout = fm_string(fm_ref, &["layout"]);
+        let fallback = LiquidObject {
+            layout: fallback_layout
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+            title: fm_string(fm_ref, &["title"]),
+            summary: fm_string(fm_ref, &["summary", "description"]),
+            tags: fm_string_list(fm_ref, "tags"),
+            publish_date: fm_string(fm_ref, &["date", "publishDate", "publish_date"]),
+            extra: fm_ref.and_then(extra_frontmatter_fields),
+            html: String::new(),
+            file_name: String::new(),
+            slug: String::new(),
+            raw: String::new(),
+            out_file_path: String::new(),
+            input_file_path: String::new(),
+        };
+        // The renderer (JS `liquidRender` callback or Rust closure)
+        // extracts the front matter, renders the Liquid content to HTML,
+        // and returns the page fields. Fields the renderer does not
+        // provide fall back to the raw front matter the cache parsed.
+        let rendered = self.render_liquid(&raw);
+        let layout = rendered
+            .as_ref()
+            .filter(|r| !r.layout.is_empty())
+            .map(|r| r.layout.clone())
+            .or_else(|| fallback_layout.clone())
+            .unwrap_or_else(|| "default".to_string());
+        let title = rendered
+            .as_ref()
+            .and_then(|r| r.title.clone())
+            .or(fallback.title);
+        let summary = rendered
+            .as_ref()
+            .and_then(|r| r.summary.clone())
+            .or(fallback.summary);
+        let tags = rendered
+            .as_ref()
+            .and_then(|r| r.tags.clone())
+            .or(fallback.tags);
+        let publish_date = rendered
+            .as_ref()
+            .and_then(|r| r.publish_date.clone())
+            .or(fallback.publish_date);
+        let extra = rendered
+            .as_ref()
+            .and_then(|r| r.extra.clone())
+            .or(fallback.extra);
+        let html = rendered.map(|r| r.html).unwrap_or_default();
         let base_url = self.hosting.base_url();
         Some(LiquidObject {
+            layout,
             file_name: liquid_file_name_no_ext(&fname),
             slug: liquid_slug(path, base, &base_url),
             raw,
             html,
             out_file_path: liquid_out_file(path, base, &self.out_dir),
             input_file_path: path.to_string_lossy().to_string(),
-            ext,
+            title,
+            summary,
+            tags,
+            publish_date,
+            extra,
         })
     }
 
@@ -1918,35 +1998,103 @@ impl BaganCache {
             .collect()
     }
 
-    /// Render a liquid template to HTML through the registered renderer.
-    /// Returns an empty string when no renderer is configured or the
-    /// renderer fails; renderer errors print to stderr.
-    fn render_liquid(&self, raw: &str) -> String {
-        let Some(renderer) = &self.liquid_renderer else {
-            return String::new();
-        };
+    /// Render a liquid collection file through the registered renderer.
+    /// Returns `None` when no renderer is configured or the renderer
+    /// fails; renderer errors print to stderr (the caller falls back to
+    /// the raw front matter parsed by the cache).
+    fn render_liquid(&self, raw: &str) -> Option<LiquidObject> {
+        let renderer = &self.liquid_renderer;
         #[cfg(feature = "npm")]
         {
-            let Some(env) = &self.liquid_env else {
-                return String::new();
-            };
+            let renderer = renderer.as_ref()?;
+            let env = self.liquid_env.as_ref()?;
             let Ok(func) = renderer.borrow_back(env) else {
                 eprintln!("liquidRender callback could not be invoked");
-                return String::new();
+                return None;
             };
-            // A single-argument call: the raw template text goes
-            // straight to the JS callback.
-            match func.call(raw.to_string()) {
-                Ok(html) => html,
+            // A single-argument call: the raw file text (front matter +
+            // Liquid content) goes straight to the JS callback. The
+            // result is converted leniently — JS consumers may return a
+            // partial object; every field falls back to the raw front
+            // matter when the callback does not provide it.
+            let value: serde_json::Value = match func.call(raw.to_string()) {
+                Ok(value) => value,
                 Err(error) => {
                     eprintln!("liquidRender callback failed: {error}");
-                    String::new()
+                    return None;
                 }
-            }
+            };
+            let value_ref = value.as_object();
+            let string_field = |keys: &[&str]| -> Option<String> {
+                value_ref.and_then(|obj| {
+                    keys.iter()
+                        .find_map(|key| obj.get(*key))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+            };
+            let string_list = |key: &str| -> Option<Vec<String>> {
+                value_ref
+                    .and_then(|obj| obj.get(key))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|v| match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .collect()
+                    })
+            };
+            Some(LiquidObject {
+                // `layout` stays empty when the callback does not
+                // provide it — the merge falls back to the raw front
+                // matter, and only then to "default".
+                layout: string_field(&["layout"]).unwrap_or_default(),
+                title: string_field(&["title"]),
+                summary: string_field(&["summary", "description"]),
+                tags: string_list("tags"),
+                publish_date: string_field(&["publishDate", "publish_date", "date"]),
+                extra: value_ref.and_then(|obj| {
+                    let named = [
+                        "layout",
+                        "title",
+                        "summary",
+                        "tags",
+                        "date",
+                        "publish_date",
+                        "publishDate",
+                        "html",
+                        "fileName",
+                        "slug",
+                        "raw",
+                        "outFilePath",
+                        "inputFilePath",
+                    ];
+                    let mut extra: HashMap<String, String> = HashMap::new();
+                    for (k, v) in obj {
+                        if named.contains(&k.as_str()) {
+                            continue;
+                        }
+                        let rendered = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        extra.insert(k.clone(), rendered);
+                    }
+                    (!extra.is_empty()).then_some(extra)
+                }),
+                html: string_field(&["html"]).unwrap_or_default(),
+                file_name: String::new(),
+                slug: String::new(),
+                raw: String::new(),
+                out_file_path: String::new(),
+                input_file_path: String::new(),
+            })
         }
         #[cfg(not(feature = "npm"))]
         {
-            renderer(raw.to_string())
+            renderer.as_ref().map(|render| render(raw.to_string()))
         }
     }
 
@@ -2127,13 +2275,20 @@ pub struct BaganCacheJsOptions {
     /// resolved against the entry directory. The discovered files are
     /// cached as text, watched, and exposed through `cache.liquids()`.
     pub liquid_collections: Option<Vec<String>>,
-    /// JavaScript function that renders a Liquid template to HTML
-    /// (`liquidRender(file: string) => string`). Invoked on the JS main
+    /// JavaScript function that renders a Liquid collection file to a
+    /// page (`liquidRender(file: string) => PageObject`). The
+    /// callback extracts the YAML front matter from the raw file,
+    /// renders the Liquid content to HTML, and returns the page fields
+    /// (the object is converted leniently — `html` is the meaningful
+    /// field, anything else falls back to the raw front matter); the
+    /// cache fills the path-derived fields (fileName, slug,
+    /// outFilePath, inputFilePath) and `raw`. Invoked on the JS main
     /// thread when liquid objects are built; a callback that throws or
-    /// returns a non-string leaves the `html` field empty. Registerable
-    /// later with `useLiquidRender()` as well.
-    #[napi(ts_type = "(file: string) => string")]
-    pub liquid_render: Option<Function<'static, String, String>>,
+    /// returns nothing leaves the front-matter fields empty and `html`
+    /// as the raw template. Registerable later with `useLiquidRender()`
+    /// as well.
+    #[napi(ts_type = "(file: string) => PageObject")]
+    pub liquid_render: Option<Function<'static, String, serde_json::Value>>,
 }
 
 // Dropping a `BaganCache` is the Rust equivalent of the JS `dispose()`:
@@ -2836,10 +2991,11 @@ mod tests {
         );
         write_layout(&tmp.join("contents"), "default");
         // Collection directory with nested liquid files + a single file.
+        // Liquid files carry YAML front matter like markdown pages.
         fs::create_dir_all(tmp.join("contents/_pages/docs"))?;
         fs::write(
             tmp.join("contents/_pages/about.html"),
-            "<h1>About {{ title }}</h1>",
+            "---\nlayout: page\ntitle: About Page\ntags:\n  - one\n  - two\ncustom: x\n---\n<h1>About {{ site }}</h1>\n",
         )?;
         fs::write(tmp.join("contents/_pages/docs/guide.html"), "<p>Guide</p>")?;
         fs::write(tmp.join("contents/contact.liquid"), "<p>Contact</p>")?;
@@ -2849,9 +3005,30 @@ mod tests {
             liquid_collections: Some(vec!["_pages".into(), "contact.liquid".into()]),
             ..Default::default()
         })?;
-        // Rust-side renderer (JS consumers pass `liquidRender` instead).
+        // Rust-side renderer (JS consumers pass `liquidRender` instead):
+        // extracts the front matter, renders the content, and returns
+        // the front-matter fields.
         #[cfg(not(feature = "npm"))]
-        cache.use_liquid_render(|file: String| file.replace("{{ title }}", "Bagan"));
+        cache.use_liquid_render(|file: String| {
+            let parsed = frontmatter(file.clone())
+                .ok()
+                .and_then(|p| p.yaml_data().cloned());
+            LiquidObject {
+                layout: fm_string(parsed.as_ref(), &["layout"])
+                    .unwrap_or_else(|| "default".to_string()),
+                title: fm_string(parsed.as_ref(), &["title"]),
+                summary: fm_string(parsed.as_ref(), &["summary", "description"]),
+                tags: fm_string_list(parsed.as_ref(), "tags"),
+                publish_date: fm_string(parsed.as_ref(), &["date", "publishDate", "publish_date"]),
+                extra: parsed.as_ref().and_then(extra_frontmatter_fields),
+                html: file.replace("{{ site }}", "Bagan"),
+                file_name: String::new(),
+                slug: String::new(),
+                raw: String::new(),
+                out_file_path: String::new(),
+                input_file_path: String::new(),
+            }
+        });
 
         // Directories are flattened and merged with configured files.
         let files = cache.liquid_files();
@@ -2864,14 +3041,29 @@ mod tests {
             .find(|l| l.input_file_path.ends_with("about.html"))
             .unwrap();
         assert_eq!(about.file_name, "about");
-        assert_eq!(about.ext, "html");
         assert_eq!(about.slug, "/about");
         assert_eq!(about.out_file_path, ".bagan/about.html");
-        assert_eq!(about.raw, "<h1>About {{ title }}</h1>");
-        // Rendered through the Rust-side closure (non-npm builds only —
-        // npm tests exercise the JS `liquidRender` callback instead).
+        assert!(about.raw.contains("layout: page"));
+        // Front-matter fields share the PageObject shape.
         #[cfg(not(feature = "npm"))]
-        assert_eq!(about.html, "<h1>About Bagan</h1>");
+        {
+            assert_eq!(about.layout, "page");
+            assert_eq!(about.title.as_deref(), Some("About Page"));
+            assert_eq!(about.tags, Some(vec!["one".to_string(), "two".to_string()]));
+            assert_eq!(about.extra.as_ref().unwrap()["custom"], "x");
+            assert_eq!(
+                about.html,
+                "---\nlayout: page\ntitle: About Page\ntags:\n  - one\n  - two\ncustom: x\n---\n<h1>About Bagan</h1>\n"
+            );
+        }
+        // Without a renderer (npm test runs): the cache still parses the
+        // raw front matter, but html stays empty.
+        #[cfg(feature = "npm")]
+        {
+            assert_eq!(about.layout, "page");
+            assert_eq!(about.title.as_deref(), Some("About Page"));
+            assert!(about.html.is_empty());
+        }
 
         let guide = liquids
             .iter()
@@ -2879,12 +3071,13 @@ mod tests {
             .unwrap();
         assert_eq!(guide.slug, "/docs/guide");
         assert_eq!(guide.out_file_path, ".bagan/docs/guide.html");
+        // No front matter → layout falls back to "default".
+        assert_eq!(guide.layout, "default");
 
         let contact = liquids
             .iter()
             .find(|l| l.input_file_path.ends_with("contact.liquid"))
             .unwrap();
-        assert_eq!(contact.ext, "liquid");
         assert_eq!(contact.slug, "/contact");
         assert_eq!(contact.out_file_path, ".bagan/contact.html");
 
@@ -2897,13 +3090,26 @@ mod tests {
                 .iter()
                 .any(|p| p.ends_with("about.html"))
         );
-        // Without a renderer the html field stays empty.
+        // Without a renderer the front-matter fields come from the raw
+        // front matter and html stays empty.
         let bare = BaganCache::with_config(BaganCacheConfig {
             entry_dir: Some("contents".into()),
             liquid_collections: Some(vec!["_pages".into(), "contact.liquid".into()]),
             ..Default::default()
         })?;
-        assert!(bare.liquid_objects().iter().all(|l| l.html.is_empty()));
+        let bare_about = bare
+            .liquid_objects()
+            .into_iter()
+            .find(|l| l.input_file_path.ends_with("about.html"))
+            .unwrap();
+        assert!(bare_about.html.is_empty());
+        assert_eq!(bare_about.layout, "page");
+        assert_eq!(bare_about.title.as_deref(), Some("About Page"));
+        assert_eq!(
+            bare_about.tags,
+            Some(vec!["one".to_string(), "two".to_string()])
+        );
+        assert_eq!(bare_about.extra.as_ref().unwrap()["custom"], "x");
 
         restore(orig, tmp);
         Ok(())

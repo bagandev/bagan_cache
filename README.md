@@ -57,24 +57,38 @@ cache.dispose();
 Local Liquid (`.html`/`.liquid`) pages are opted-in through
 `liquidCollections` — directories (flattened recursively) or single
 files, resolved against the entry directory and required to live inside
-it:
+it. The collected files carry YAML front matter like markdown pages, so
+`LiquidObject` shares the `PageObject` shape (`layout`, `title`,
+`summary`, `tags`, `publishDate`, `extra`, …):
 
 ```js
 const cache = new BaganCache("contents", null, {
   liquidCollections: ["_pages", "about.html"],
-  // Renders a template to HTML on the JS side (optional; also
+  // (file: string) => LiquidObject — extracts the front matter and
+  // renders the Liquid content to HTML on the JS side (also
   // registerable later with `cache.useLiquidRender(cb)`):
-  liquidRender: (file) => liquid.parseAndRenderSync(file),
+  liquidRender: (file) => {
+    const { cleanContent, yamlData } = frontmatter(file);
+    return {
+      ...yamlData, // layout, title, tags, …
+      html: liquid.parseAndRenderSync(cleanContent),
+    };
+  },
 });
 
-cache.liquids(); // LiquidObject[]: { fileName, slug, raw, html,
-//   outFilePath, inputFilePath, ext }
+cache.liquids(); // LiquidObject[]: { layout, fileName, slug, raw, html,
+//   outFilePath, inputFilePath, title, summary, tags, publishDate, extra }
 cache.getLiquid(absPath); // single LiquidObject (or null)
 cache.liquidFiles(); // absolute paths of the tracked files
 ```
 
-Tracked files are cached like pages, watched for changes (create/modify/
-remove keep `liquids()` in sync), and excluded from `assets()`/`assetFiles()`.
+The callback receives the raw file (front matter included) and returns
+the front-matter fields plus the rendered `html`; the cache fills the
+path-derived fields (`fileName`, `slug`, `outFilePath`,
+`inputFilePath`) and `raw` itself. Without a callback, the cache parses
+the raw front matter for the fields and leaves `html` empty. Tracked
+files are cached like pages, watched for changes (create/modify/remove
+keep `liquids()` in sync), and excluded from `assets()`/`assetFiles()`.
 Slugs are relative to the collection directory for directory collections
 (`_pages/about.html` → `/about`) and to the entry directory for single
 files; `about.liquid.html` keeps its emitted `.html` extension
