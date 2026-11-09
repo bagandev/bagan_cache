@@ -19,6 +19,15 @@ use std::sync::{Arc, Mutex};
 
 /// A page rendered for a Liquid theme: front-matter fields flattened next
 /// to pipeline-derived fields (layout, slug, html, …).
+///
+/// The same shape backs both markdown pages and Liquid
+/// (`.html`/`.liquid`) collection pages: markdown `html` is rendered by
+/// Peisar, Liquid `html` by the JS-side `liquidRender(file)` callback;
+/// front-matter-derived fields (`layout`, `title`, `summary`, `tags`,
+/// `publishDate`, `extra`) come from front matter (falling back to the
+/// callback's returned object for Liquid pages), and path-derived fields
+/// (`fileName`, `slug`, `outFilePath`, `inputFilePath`) are computed by
+/// the cache.
 #[cfg_attr(feature = "npm", napi(object))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,15 +35,23 @@ pub struct PageObject {
     /// Layout name from front matter (e.g. `default`, `page`, `post`);
     /// `"default"` when front matter does not set one.
     pub layout: String,
-    /// File name without extension (`foo.md` → `foo`); `index` for
-    /// directory roots. Used as a search / lookup key.
+    /// File name without extension (`foo.md`/`foo.html` → `foo`); `index`
+    /// for directory roots. Used as a search / lookup key.
     pub file_name: String,
-    /// Request URL for the page (`path/to/foo.md` → `/path/to/foo`).
+    /// Request URL for the page (`path/to/foo.md` → `/path/to/foo`;
+    /// Liquid files strip the `html`/`liquid` extension).
     pub slug: String,
-    /// HTML rendered from the markdown by Peisar.
+    /// Raw file content (Liquid templates: front matter + template,
+    /// UTF-8 text).
+    #[serde(default)]
+    pub raw: String,
+    /// HTML rendered from the page content (Peisar for markdown, the
+    /// JS-side `liquidRender(file)` callback for Liquid templates —
+    /// empty when no callback is configured).
     pub html: String,
-    /// Build output path (`path/to/foo.md` → `outDir/path/to/foo/index.html`),
-    /// relative to the output root unless absolute.
+    /// Build output path (`path/to/foo.md` → `outDir/path/to/foo/index.html`,
+    /// `path/to/foo.html` → `outDir/path/to/foo.html`), relative to the
+    /// output root unless absolute.
     pub out_file_path: String,
     /// Original absolute source path (watch-process identity).
     pub input_file_path: String,
@@ -72,55 +89,6 @@ pub struct AssetsObject {
     /// Kind classification: `"Js"`, `"Css"`, `"Image"`, `"Video"`,
     /// `"Font"`, or `"Other"`.
     pub file_type: String,
-}
-
-/// A Liquid (`.html`) template tracked through one of the configured
-/// `liquidCollections` directories/files. The template carries YAML front
-/// matter like a markdown file; the JS-side `liquidRender(file)` callback
-/// extracts the front matter, renders the Liquid content to HTML, and
-/// returns the front-matter fields, so the object shares the
-/// [`PageObject`] shape with markdown pages.
-///
-/// Front-matter-derived fields (`layout`, `title`, `summary`, `tags`,
-/// `publishDate`, `extra`) come from the callback's returned object
-/// (falling back to the raw front matter when no callback is
-/// configured); path-derived fields (`fileName`, `slug`, `outFilePath`,
-/// `inputFilePath`) are computed by the cache.
-#[cfg_attr(feature = "npm", napi(object))]
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LiquidObject {
-    /// Layout name from front matter (e.g. `default`, `page`, `post`);
-    /// `"default"` when front matter does not set one.
-    pub layout: String,
-    /// File name without extension (`foo.html` → `foo`).
-    pub file_name: String,
-    /// Request URL for the rendered file (`docs/foo.html` → `/docs/foo`);
-    /// the `html` extension is stripped and the resolved baseUrl is
-    /// prefixed.
-    pub slug: String,
-    /// Raw file content (front matter + Liquid template, UTF-8 text).
-    pub raw: String,
-    /// HTML rendered from the Liquid content by the JS-side
-    /// `liquidRender(file)` callback. Empty when no callback is
-    /// configured.
-    pub html: String,
-    /// Build output path (`path/to/foo.html` → `outDir/path/to/foo.html`).
-    pub out_file_path: String,
-    /// Original absolute source path (watch-process identity).
-    pub input_file_path: String,
-    /// Page title from front matter.
-    pub title: Option<String>,
-    /// Short description from front matter.
-    pub summary: Option<String>,
-    /// Category tags from front matter.
-    pub tags: Option<Vec<String>>,
-    /// Publication date from front matter (string form `yyyy-mm-dd`).
-    pub publish_date: Option<String>,
-    /// Any extra front-matter keys not mapped to a named field, exposed
-    /// verbatim (as strings) so themes can render `{{ page.custom }}`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extra: Option<HashMap<String, String>>,
 }
 
 /// Classify an asset extension into the `fileType` buckets.
@@ -219,6 +187,8 @@ pub fn asset_out_file(path: &Path, base_dir: &Path, out_dir: &str) -> String {
 /// Compute the URL slug for a Liquid template file: the `html`/`liquid`
 /// extension is stripped (`docs/foo.html` → `/docs/foo`), the resolved
 /// baseUrl is prefixed, and the path is relative to `base_dir`.
+/// `index.html` collapses to its directory root (`docs/index.html` →
+/// `/docs`; a root index → `/`), mirroring the markdown pretty-URL rule.
 /// `liquid.html` keeps the final `.html` (`page.liquid.html` →
 /// `/page.html`) because the emitted file carries that extension.
 pub fn liquid_slug(path: &Path, base_dir: &Path, base_url: &str) -> String {
@@ -236,6 +206,14 @@ pub fn liquid_slug(path: &Path, base_dir: &Path, base_url: &str) -> String {
         rel.rsplit_once('.')
             .map(|(stem, _)| stem.to_string())
             .unwrap_or(rel)
+    };
+    // Pretty URLs: `index` collapses to the directory root.
+    let slug = if slug == "index" {
+        String::new()
+    } else if let Some(stripped) = slug.strip_suffix("/index") {
+        stripped.to_string()
+    } else {
+        slug
     };
     if slug.is_empty() {
         base_url.trim_end_matches('/').to_string() + "/"
