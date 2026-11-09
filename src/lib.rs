@@ -1,21 +1,117 @@
 //! Memory-first cache of a site's Markdown and asset files.
+//!
+//! [`BaganCache`] loads supported Markdown files whose front-matter layout
+//! matches a theme template (plus optional assets) into an in-memory LRU
+//! store, derives template-ready [`PageObject`] / [`AssetsObject`] values on
+//! demand, and
+//! — in the background — flushes content into a binary shard archive
+//! under `.peisar-cache` (with a `map.json` search index). Disk is *not*
+//! the primary store: reads hit memory first and only fall through to the
+//! archive for entries the LRU has evicted.
+//!
+//! # JS usage (napi-rs surface)
+//!
+//! ```js
+//! const cache = new BaganCache("contents", "public", {
+//!   markdown: { fragment: true },
+//!   archive: { shardBytes: 8 * 1024 * 1024, flushIntervalMs: 2000 },
+//!   hosting: { provider: "GithubPages", repo: "site" },
+//!   outDir: "out",
+//!   liquidCollections: ["_pages", "about.html"],
+//!   liquidRender: (file) => renderLiquid(file), // (file) => LiquidObject
+//! });
+//! cache.pages();                    // PageObject[] — for Liquid themes
+//! cache.getPage("docs/intro.md");   // single page object (or null)
+//! cache.assets();                    // AssetsObject[]
+//! cache.liquids();                  // LiquidObject[] — rendered Liquid pages
+//! cache.mapJson();                   // the map.json document (search index)
+//! cache.archived();                  // paths flushed to the disk archive
+//! cache.startWatchingJs();           // keep everything in sync with the FS
+//! cache.dispose();                   // stop watching and flush the archive
+//! ```
+//!
+//! While watching, every file operation logs one pretty line to stderr —
+//! `created docs/intro.md` (ANSI-colored on terminals, path relative to
+//! the project root). Duplicate events from one save coalesce, and
+//! filesystem noise is not logged.
+//!
+//! # Rust usage
+//!
+//! ```no_run
+//! use bagan_cache::{CachedContent, BaganCache, BaganCacheConfig};
+//! use std::path::Path;
+//!
+//! # fn main() -> std::io::Result<()> {
+//! let mut cache = BaganCache::with_config(BaganCacheConfig {
+//!     entry_dir: Some("contents".into()),
+//!     assets_dir: Some("contents/public".into()),
+//!     ..BaganCacheConfig::default()
+//! })?;
+//! for path in cache.markdown_files() {
+//!     if let Some(CachedContent::Text(md)) = cache.get(Path::new(&path)) {
+//!         println!("{} ({} bytes)", path, md.len());
+//!     }
+//! }
+//! cache.start_watching()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Discovery rules
+//!
+//! - *Markdown*: files under the entry directory whose extension is `md`,
+//!   `markdown`, `mdown`, `mkdn`, `mkd`, `mdwn`, `mkdown`, or `ron`; cached
+//!   as UTF-8 text when their front-matter layout matches an HTML layout
+//!   template in the theme.
+//! - *Assets*: files under the assets directory with a known image, script,
+//!   style, font, or audio/video extension. Binary types are cached as raw
+//!   bytes; `js`, `css`, `map`, and `svg` are cached as UTF-8 text.
+//! - *Liquid*: `.html` / `.liquid` files inside the configured
+//!   `liquidCollections` (directories are flattened recursively, files are
+//!   taken as-is; both are resolved against the entry directory and must
+//!   live inside it). The files carry YAML front matter like markdown
+//!   pages; the JS-side `liquidRender(file)` callback extracts it, renders
+//!   the Liquid content to HTML, and returns the front-matter fields, so
+//!   [`LiquidObject`](crate::LiquidObject) values share the
+//!   [`PageObject`](crate::PageObject) shape.
+//!
+//! # Tiering
+//!
+//! 1. **Memory (hot)** — an LRU bounded by `byteBudget`/`entryBudget` in
+//!    `memory` config (or the constructor options). All reads start here.
+//!
+//! 2. **Disk archive (cold)** — a background worker buffers upserts and
+//!    flushes binary shards under `.peisar-cache` when the pending content
+//!    crosses `shardBytes`, on the `flushIntervalMs` tick, or on
+//!    flush/dispose/drop. `map.json` maps every flushed path to its shard
+//!    location and (for markdown) its parsed front matter.
+//!
+//! Entries evicted from memory stay readable via the archive
+//! (`getText`/`getBinary` fall through), so the byte budget is a *hot set*
+//! limit, not a correctness limit.
+//!
+//! # Threading and lifecycle
+//!
+//! The archive worker and file watcher run on background threads. JS
+//! consumers call `dispose()` (or drop the cache in Rust) to stop the
+//! watcher, flush pending archive writes, and join the workers. Rust
+//! consumers may also call [`BaganCache::stop_watching`] for the same
+//! graceful shutdown — e.g. after a `Ctrl+C` interrupt.
 
-// cspell:disable
-
-// fn with_config_inner(env: Env, config: BaganCacheOptions) -> io::Result<Self> {
 mod archive;
 mod base_url;
 mod def;
 mod file;
-mod log;
 mod lru;
 mod obj_cache;
 mod theme;
-mod utils;
 
 pub use archive::ArchiveHandle;
 pub use base_url::{BaseDirInfo, HostingProvider};
-use def::{DEFAULT_ARCHIVE_DIR_NAME, DEFAULT_OUT_DIR, NODE_MODULES_DIR};
+use def::{
+    DEFAULT_ARCHIVE_DIR_NAME, DEFAULT_BYTE_BUDGET, DEFAULT_FLUSH_INTERVAL_MS, DEFAULT_OUT_DIR,
+    DEFAULT_SHARD_BYTES, NODE_MODULES_DIR,
+};
 pub use lru::LruCache;
 pub use obj_cache::{
     AssetsObject, LiquidObject, ObjectCache, PageObject, asset_file_type, asset_out_file,
@@ -28,11 +124,14 @@ use file::{
     ASSET_BINARY_EXTENSIONS, ASSET_EXTENSIONS, LIQUID_EXTENSIONS, MARKDOWN_EXTENSIONS,
     collect_asset_files, collect_markdown_files, has_liquid_extension,
 };
-use log::{classify_change, log_change_pretty, should_log_change};
+#[cfg(feature = "npm")]
 use napi::bindgen_prelude::*;
+#[cfg(feature = "npm")]
 use napi::threadsafe_function::ThreadsafeFunction;
+#[cfg(feature = "npm")]
 use napi_derive::napi;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(feature = "npm")]
 use peisar::plugin::Plugin;
 use peisar::{
     PeisarOptions, RenderOptions,
@@ -41,17 +140,17 @@ use peisar::{
     plugin::{ParserHooks, RegisteredPlugin, visit_document_mut},
     render_document_html,
 };
-use utils::{ArchiveConfig, CacheChangeEvent, CachedContent, HostingConfig, MemoryConfig};
 
 use peisar_yaml::frontmatter;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// JS-side Liquid renderer for the configured `liquidCollections`
 /// (npm builds): a synchronous `liquidRender(file: string) =>
@@ -67,73 +166,305 @@ use std::time::Instant;
 /// borrowed at render time (see
 /// [`RegisteredPlugin`](peisar::plugin::RegisteredPlugin) for the same
 /// pattern).
+#[cfg(feature = "npm")]
 pub type LiquidRenderer = FunctionRef<String, serde_json::Value>;
-/// JavaScript callback type used by the options object. A `FunctionRef`
-/// cannot be converted directly from/to an N-API value.
-pub type LiquidRenderFunction = Function<'static, String, serde_json::Value>;
 
-#[napi(object)]
-pub struct BaganCacheOptions {
+/// Rust-side Liquid renderer for the configured `liquidCollections`
+/// (non-npm builds): takes the raw file text and returns the
+/// front-matter fields + rendered HTML as a [`LiquidObject`].
+#[cfg(not(feature = "npm"))]
+pub type LiquidRenderer = Box<dyn Fn(String) -> LiquidObject + Send + Sync + 'static>;
+
+/// ANSI color escape sequences for the watcher's pretty logs (disabled
+/// automatically when stderr is not an interactive terminal).
+const LOG_STYLE_DIM: &str = "\u{1b}[2m";
+const LOG_STYLE_GREEN: &str = "\u{1b}[32m";
+const LOG_STYLE_YELLOW: &str = "\u{1b}[33m";
+const LOG_STYLE_RED: &str = "\u{1b}[31m";
+const LOG_STYLE_RESET: &str = "\u{1b}[0m";
+
+/// `true` when the watcher's pretty logs may use ANSI colors — stderr
+/// must be an interactive terminal. Captured/piped output (CI logs, test
+/// runners) stays plain.
+fn log_use_color() -> bool {
+    io::stderr().is_terminal()
+}
+
+/// Build one pretty watcher line: `<label> <path>` with the label
+/// colored by change kind (when `color` is on). Paths are shown relative
+/// to `root` when possible, falling back to the absolute path for files
+/// outside it.
+fn format_change_line(kind: &str, path: &Path, root: &Path, color: bool) -> String {
+    let (label, style) = match kind {
+        "create" => ("created", LOG_STYLE_GREEN),
+        "modify" => ("modified", LOG_STYLE_YELLOW),
+        "remove" => ("removed", LOG_STYLE_RED),
+        _ => ("changed", LOG_STYLE_DIM),
+    };
+    let rel = pretty_path(path, root);
+    if color {
+        format!("{style}{label}{LOG_STYLE_RESET} {rel}")
+    } else {
+        format!("{label} {rel}")
+    }
+}
+
+/// Print one pretty watcher line to stderr — see
+/// [`BaganCache::start_watching`] for the format.
+fn log_change_pretty(kind: &str, path: &Path, root: &Path) {
+    eprintln!("{}", format_change_line(kind, path, root, log_use_color()));
+}
+
+/// Window within which consecutive events for the same path count as
+/// one operation. Shell redirects, editors, and atomic saves emit
+/// several events for a single save — only the first within this
+/// window logs.
+const LOG_DEDUPE_WINDOW: Duration = Duration::from_secs(1);
+
+/// `true` when a path may ever enter the cache (and therefore deserves
+/// a pretty log line): markdown and asset extensions are the same
+/// allow-lists the cache admits content by, so editor side files
+/// (`.tmp`, swap files, lock files, …) never log.
+fn log_trackable(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| {
+            let ext_l = ext.to_lowercase();
+            MARKDOWN_EXTENSIONS.contains(&ext_l.as_str())
+                || ASSET_EXTENSIONS.contains(&ext_l.as_str())
+                || LIQUID_EXTENSIONS.contains(&ext_l.as_str())
+                || path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.to_lowercase().ends_with(".liquid.html"))
+        })
+        .unwrap_or(false)
+}
+
+/// Decide whether a watcher event gets a pretty log line: each path
+/// logs at most once per [`LOG_DEDUPE_WINDOW`] (create/remove included —
+/// renames and atomic saves fire several events per operation) and
+/// only for files the cache could ever track. Events are delivered to
+/// `onChange` subscribers either way — this only filters the stderr log.
+fn should_log_change(path: &Path, last_log_at: &HashMap<PathBuf, Instant>, now: Instant) -> bool {
+    log_trackable(path)
+        && !last_log_at
+            .get(path)
+            .is_some_and(|at| now.duration_since(*at) < LOG_DEDUPE_WINDOW)
+}
+
+/// Classify a watcher event from the **actual filesystem state** rather
+/// than the raw notify event kind. Editors and atomic saves surface as
+/// rename events ("modify"/"other" on the notify side), so the raw kind
+/// cannot be trusted for a correct `created` / `modified` / `removed`
+/// label:
+///
+/// - the file **exists** and was **already known to the cache** →
+///   `modify` (the entry is being updated in place);
+/// - the file **exists** and is **unknown** → `create`;
+/// - the file is **gone** → `remove`.
+///
+/// `known` here means present in the cache tiers — exactly the paths a
+/// create is allowed to add.
+fn classify_change(memory: &LruCache, archive: &ArchiveHandle, path: &Path) -> &'static str {
+    let known = memory.get(path).is_some() || archive.read(path).is_some();
+    if path.exists() {
+        if known { "modify" } else { "create" }
+    } else {
+        "remove"
+    }
+}
+
+/// Render `path` relative to `root` when it lives underneath it
+/// (`/project/contents/docs/a.md` → `contents/docs/a.md`), otherwise as
+/// the lossy absolute path.
+fn pretty_path(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|rel| rel.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().to_string())
+}
+
+/// A file-change event delivered to change callbacks
+/// (see [`BaganCache::on_change`]).
+#[cfg_attr(feature = "npm", napi(object))]
+#[derive(Debug, Clone)]
+pub struct CacheChangeEvent {
+    /// Absolute path of the changed file.
+    pub path: String,
+    /// `"create"`, `"modify"`, `"remove"`, or `"other"`.
+    pub kind: String,
+    /// `true` when the file is under the markdown entry directory.
+    pub is_markdown: bool,
+}
+
+/// An entry stored in the cache: raw UTF-8 text (markdown and textual
+/// assets) or raw bytes (binary assets). Exposed to JavaScript so JS
+/// consumers can branch on the variant. The serde derives back the
+/// bincode round-trip through the disk archive.
+#[cfg_attr(feature = "npm", napi)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum CachedContent {
+    /// UTF-8 text content (markdown files and textual assets).
+    Text(String),
+    /// Raw bytes (binary assets like images or fonts).
+    Binary(Vec<u8>),
+}
+
+/// Cache-wide configuration: directories, markdown options, memory/archive
+/// budgets, hosting/baseUrl resolution, and the build output directory.
+#[cfg_attr(feature = "npm", napi(object))]
+#[derive(Debug, Clone, Default)]
+pub struct BaganCacheConfig {
+    /// Entry directory holding the markdown files (absolute, or relative
+    /// to the current working directory). Defaults to the current directory.
     pub entry_dir: Option<String>,
+    /// Optional assets directory, resolved from the current working
+    /// directory and required to be inside `entry_dir`.
     pub assets_dir: Option<String>,
-    pub memory: Option<MemoryConfig>,
-    /// Theme package name (Jekyll-gem style), resolved from
-    /// `node_modules/<theme>`. Omit (null/undefined) for a local site:
-    /// the theme directories below are then resolved from the entry
-    /// directory.
+    /// Theme package name (Jekyll-gem style). When set, the theme is
+    /// resolved from `node_modules/<theme>` and its default export is
+    /// read as the theme configuration. When unset, the site is local:
+    /// the theme directories below are resolved from the entry
+    /// directory instead.
     pub theme: Option<String>,
-    /// Local layouts directory (local mode only), relative to the entry
-    /// directory. Defaults to `_layouts`.
+    /// Local layouts directory (used when `theme` is unset), resolved
+    /// from the entry directory. Defaults to `_layouts`.
     pub theme_layouts_dir: Option<String>,
-    /// Local includes directory (local mode only), relative to the entry
-    /// directory. Defaults to `_includes`.
+    /// Local includes directory (used when `theme` is unset), resolved
+    /// from the entry directory. Defaults to `_includes`.
     pub theme_includes_dir: Option<String>,
-    /// Local theme assets directory (local mode only), relative to the
-    /// entry directory. Defaults to `_assets`.
+    /// Local assets directory (used when `theme` is unset), resolved
+    /// from the entry directory. Defaults to `_assets`.
     pub theme_assets_dir: Option<String>,
-    /// Local data directory (local mode only), relative to the entry
-    /// directory. Defaults to `_data`.
+    /// Local data directory (used when `theme` is unset), resolved from
+    /// the entry directory. Defaults to `_data`.
     pub theme_data_dir: Option<String>,
-    /// Theme configuration object (`themeConfigObject`). When omitted
-    /// (and `theme` is set) it is loaded automatically from the theme
-    /// package's default export.
+    /// Theme configuration object (`themeConfigObject`). In theme mode
+    /// the napi constructor loads it automatically from the theme
+    /// package's default export; pass it explicitly to skip the
+    /// automatic load (required for pure-Rust consumers, which have no
+    /// JS runtime to evaluate the export). Ignored when `theme` is unset.
     pub theme_config: Option<BaganThemeConfig>,
-    /// Markdown parsing/rendering options (`fragment`, GFM, …).
+    /// Markdown parsing/rendering options applied to every page render
+    /// (GFM/Kramdown toggles, `fragment`, title, …). Custom visitors and
+    /// parser hooks are registered separately via `usePlugin()`.
     pub markdown: Option<PeisarOptions>,
-    /// Disk-archive thresholds (shard size / flush interval).
+    /// Memory-tier budgets (LRU eviction). Defaults: 64 MiB bytes,
+    /// unlimited entries.
+    pub memory: Option<MemoryConfig>,
+    /// Disk-archive tier thresholds. Defaults: 8 MiB shards, 2 s flush.
     pub archive: Option<ArchiveConfig>,
-    /// Static-hosting baseUrl resolution.
+    /// Static-hosting baseUrl resolution (GitHub Pages/Vercel/…).
     pub hosting: Option<HostingConfig>,
-    /// Build output directory.
+    /// Build output directory used for `outFilePath` fields (default
+    /// `".bagan"`).
     pub out_dir: Option<String>,
-    /// Disk-archive directory.
+    /// Archive directory, relative to the current working directory
+    /// (default `".peisar-cache"`).
     pub cache_dir: Option<String>,
     /// Liquid (`.html`) collections inside the entry directory: each
     /// entry is a directory (flattened recursively) or a single file,
     /// resolved against the entry directory. The discovered files are
-    /// cached as text, watched, and exposed through `cache.liquids()`.
+    /// cached as text, watched for changes, and exposed as
+    /// [`LiquidObject`](crate::LiquidObject) values. Entries outside the
+    /// entry directory are rejected at construction.
     pub liquid_collections: Option<Vec<String>>,
-    /// JavaScript function that renders a Liquid collection file to a
-    /// page (`liquidRender(file: string) => PageObject`). The
-    /// callback extracts the YAML front matter from the raw file,
-    /// renders the Liquid content to HTML, and returns the page fields
-    /// (the object is converted leniently — `html` is the meaningful
-    /// field, anything else falls back to the raw front matter); the
-    /// cache fills the path-derived fields (fileName, slug,
-    /// outFilePath, inputFilePath) and `raw`. Invoked on the JS main
-    /// thread when liquid objects are built; a callback that throws or
-    /// returns nothing leaves the front-matter fields empty and `html`
-    /// as the raw template. Registerable later with `useLiquidRender()`
-    /// as well.
-    #[napi(ts_type = "(file: string) => PageObject")]
-    pub liquid_render: Option<LiquidRenderFunction>,
+}
+
+/// LRU budgets for the memory tier.
+#[cfg_attr(feature = "npm", napi(object))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryConfig {
+    /// Maximum total bytes of raw content kept in memory (`0` =
+    /// unlimited). When the budget is exceeded, the least recently used
+    /// entries are evicted (they remain readable from the disk archive).
+    pub byte_budget: Option<i64>,
+    /// Maximum number of entries in memory (`0` = unlimited).
+    pub entry_budget: Option<u32>,
+}
+
+impl MemoryConfig {
+    /// Resolved byte budget (`0` = unlimited).
+    pub fn byte_budget(&self) -> u64 {
+        self.byte_budget
+            .unwrap_or(DEFAULT_BYTE_BUDGET as i64)
+            .max(0) as u64
+    }
+
+    /// Resolved entry budget (`0` = unlimited).
+    pub fn entry_budget(&self) -> usize {
+        self.entry_budget.unwrap_or(0) as usize
+    }
+}
+
+/// Flush thresholds for the disk-archive tier.
+#[cfg_attr(feature = "npm", napi(object))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ArchiveConfig {
+    /// Pending-content threshold (bytes) that triggers writing a new
+    /// shard; `0` disables size-based flushing (interval/drop only).
+    pub shard_bytes: Option<i64>,
+    /// Maximum time (ms) pending entries may sit in the worker buffer
+    /// before being flushed. `0` disables the timer.
+    pub flush_interval_ms: Option<i64>,
+}
+
+impl ArchiveConfig {
+    /// Resolved shard threshold.
+    pub fn shard_bytes(&self) -> u64 {
+        self.shard_bytes
+            .unwrap_or(DEFAULT_SHARD_BYTES as i64)
+            .max(0) as u64
+    }
+
+    /// Resolved flush interval.
+    pub fn flush_interval(&self) -> Duration {
+        Duration::from_millis(
+            self.flush_interval_ms
+                .unwrap_or(DEFAULT_FLUSH_INTERVAL_MS as i64)
+                .max(0) as u64,
+        )
+    }
+}
+
+/// Static-hosting configuration for baseUrl resolution.
+#[cfg_attr(feature = "npm", napi(object))]
+#[derive(Debug, Clone, Default)]
+pub struct HostingConfig {
+    /// Hosting provider (see [`HostingProvider`]).
+    #[cfg_attr(feature = "npm", napi(ts_type = "BaganHostingProvider"))]
+    pub provider: Option<HostingProvider>,
+    /// GitHub repository name for project pages (`/<repo>/` prefix).
+    pub repo: Option<String>,
+    /// Custom site URL (overrides provider defaults when set).
+    pub site_url: Option<String>,
+    /// Extra path prefix (e.g. `"subpath"` for `example.com/subpath/`).
+    pub path_prefix: Option<String>,
+}
+
+impl HostingConfig {
+    fn resolve(&self) -> BaseDirInfo {
+        let mut info = BaseDirInfo::new(
+            self.provider.unwrap_or(HostingProvider::Custom),
+            self.repo.clone(),
+            self.site_url.clone(),
+        );
+        info.path_prefix = self.path_prefix.clone();
+        info
+    }
+}
+
+impl Default for BaseDirInfo {
+    fn default() -> Self {
+        Self::new(HostingProvider::Custom, None, None)
+    }
 }
 
 /// Boxed change callback held in the subscription registry.
 ///
 /// In npm builds, JavaScript callbacks are wrapped into a thread-safe
 /// function before they are stored because watcher events fire off-thread.
-pub type ChangeCallback = Box<dyn Fn(CacheChangeEvent) + Send + 'static>;
+pub type CacheChangeCallback = Box<dyn Fn(CacheChangeEvent) + Send + 'static>;
 
 /// Event-loop keep-alive held while the watcher runs (npm builds): a
 /// strong (ref'd) threadsafe function, so Node keeps running as long as
@@ -141,20 +472,21 @@ pub type ChangeCallback = Box<dyn Fn(CacheChangeEvent) + Send + 'static>;
 ///
 /// `CalleeHandled = false` matches what
 /// [`Function::build_threadsafe_function`] produces.
+#[cfg(feature = "npm")]
 pub type KeepAlive = ThreadsafeFunction<(), Unknown<'static>, (), Status, false>;
 
-// Backward-compatible name for callbacks used by the JavaScript binding.
-// pub type JsChangeCallback = CacheChangeCallback;
+/// Backward-compatible name for callbacks used by the JavaScript binding.
+pub type JsChangeCallback = CacheChangeCallback;
 
-// Shared registry of change callbacks, keyed by subscription id.
+/// Shared registry of change callbacks, keyed by subscription id.
 #[derive(Clone, Default)]
 struct ChangeCallbacks {
-    inner: Arc<Mutex<HashMap<u32, ChangeCallback>>>,
+    inner: Arc<Mutex<HashMap<u32, CacheChangeCallback>>>,
     next_id: Arc<AtomicU32>,
 }
 
 impl ChangeCallbacks {
-    fn add(&self, cb: ChangeCallback) -> u32 {
+    fn add(&self, cb: CacheChangeCallback) -> u32 {
         let mut map = self.inner.lock().unwrap();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         map.insert(id, cb);
@@ -177,12 +509,80 @@ impl ChangeCallbacks {
     }
 }
 
+/// In-memory + archive-backed cache of the Markdown and asset files under a
+/// directory tree.
+///
+/// Memory is the source of truth for hot content; a background worker
+/// flushes a binary shard archive to `.peisar-cache` for cold/large
+/// entries, front-ended by the `map.json` search index. Watchers keep the
+/// memory tier in sync with the filesystem.
+#[cfg_attr(feature = "npm", napi)]
+pub struct BaganCache {
+    /// LRU memory tier: absolute source path → raw content. Clone-shared
+    /// with the watcher thread.
+    memory: LruCache,
+    /// Disk-archive tier handle (shards + map.json index). Clone-shared
+    /// with the watcher thread.
+    archive: ArchiveHandle,
+    plugins: Arc<Mutex<Vec<RegisteredPlugin>>>,
+    /// Resolved markdown AST options (GFM/Kramdown, file name).
+    ast_opts: AstOptions,
+    /// Resolved markdown render options (fragment, title, …).
+    render_opts: RenderOptions,
+    watcher: Option<RecommendedWatcher>,
+    /// Keep-alive handle for the Node event loop while watching is
+    /// active (npm builds only): a strong (ref'd) threadsafe function
+    /// over a no-op JS callback. The native `notify` watcher thread is
+    /// invisible to libuv, so without this a plain script like
+    /// `cache.startWatchingJs()` would exit the moment the script ends.
+    /// `stop_watching` / `dispose` / dropping the cache drop the handle,
+    /// which lets the process exit again.
+    #[cfg(feature = "npm")]
+    watch_keep_alive: Option<KeepAlive>,
+    entry_dir: PathBuf,
+    assets_dir: Option<PathBuf>,
+    theme_path: PathBuf,
+    theme_config: BaganThemeConfig,
+    theme_assets_dir: PathBuf,
+    theme_layouts_dir: PathBuf,
+    theme_data_dir: PathBuf,
+    theme_includes_dir: PathBuf,
+    markdown_layouts: HashSet<String>,
+    change_callbacks: ChangeCallbacks,
+    /// Hosting/baseUrl configuration.
+    hosting: BaseDirInfo,
+    /// Build output directory (for `outFilePath` fields).
+    out_dir: String,
+    /// Liquid (`.html`) collections: tracked absolute files mapped to
+    /// their slug base directory (the collection root for directories,
+    /// the entry directory for single files). Clone-shared with the
+    /// watcher thread.
+    liquid_files: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
+    /// Configured liquid collection roots (the raw resolved
+    /// directories/files from `liquidCollections`), used to re-flatten
+    /// after directory-level events. Clone-shared with the watcher thread.
+    liquid_collection_roots: Arc<Mutex<Vec<PathBuf>>>,
+    /// JS-side `liquidRender(file)` callback for LiquidObject values
+    /// (npm builds hold a `FunctionRef` + the napi `Env` captured at
+    /// construction; rendering runs on the JS main thread only). The
+    /// callback returns the front-matter fields + rendered HTML.
+    #[cfg(feature = "npm")]
+    liquid_renderer: Option<LiquidRenderer>,
+    /// Rust-side Liquid renderer (non-npm builds).
+    #[cfg(not(feature = "npm"))]
+    liquid_renderer: Option<LiquidRenderer>,
+    /// The napi `Env` captured at construction, used to `borrow_back` the
+    /// `liquidRenderer` callback (npm builds only).
+    #[cfg(feature = "npm")]
+    liquid_env: Option<Env>,
+}
+
 /// Build the event-loop keep-alive held while the watcher runs: a strong
 /// (ref'd, i.e. NOT `.weak()`) threadsafe function over a no-op JS
 /// function. The ref'd TSFN is visible to libuv, so Node keeps the
 /// process alive as long as the handle exists; dropping it unrefs the
 /// loop again and lets the process exit.
-
+#[cfg(feature = "npm")]
 fn build_keep_alive(env: &napi::Env) -> Result<KeepAlive> {
     // `()` is `Undefined`: the no-op callback takes no arguments and
     // returns nothing, it is never actually invoked. The default (strong)
@@ -195,7 +595,7 @@ fn build_keep_alive(env: &napi::Env) -> Result<KeepAlive> {
 
 /// The no-op JS callback backing the event-loop keep-alive. The return
 /// value must be a valid `napi_value`, so it returns `undefined`.
-
+#[cfg(feature = "npm")]
 unsafe extern "C" fn noop(
     env: napi::sys::napi_env,
     _info: napi::sys::napi_callback_info,
@@ -423,6 +823,7 @@ fn theme_config_from_package_json(theme_path: &Path) -> BaganThemeConfig {
 /// when the package cannot be required (pure asset themes without a JS
 /// entry are a supported setup); the require failure is caught inside
 /// the script so no pending JS exception is left on the env.
+#[cfg(feature = "npm")]
 fn load_theme_config_from_module(
     env: &Env,
     cwd: &Path,
@@ -449,68 +850,8 @@ fn load_theme_config_from_module(
     let theme_default: Option<BaganThemeConfig> = env.run_script(script)?;
     Ok(theme_default)
 }
-/// In-memory + archive-backed cache of the Markdown and asset files under a
-/// directory tree.
-///
-/// Memory is the source of truth for hot content; a background worker
-/// flushes a binary shard archive to `.peisar-cache` for cold/large
-/// entries, front-ended by the `map.json` search index. Watchers keep the
-/// memory tier in sync with the filesystem.
-#[napi]
-pub struct BaganCache {
-    /// LRU memory tier: absolute source path → raw content. Clone-shared
-    /// with the watcher thread.
-    memory: LruCache,
-    /// Disk-archive tier handle (shards + map.json index). Clone-shared
-    /// with the watcher thread.
-    archive: ArchiveHandle,
-    plugins: Arc<Mutex<Vec<RegisteredPlugin>>>,
-    /// Resolved markdown AST options (GFM/Kramdown, file name).
-    ast_opts: AstOptions,
-    /// Resolved markdown render options (fragment, title, …).
-    render_opts: RenderOptions,
-    watcher: Option<RecommendedWatcher>,
-    /// Keep-alive handle for the Node event loop while watching is
-    /// active (npm builds only): a strong (ref'd) threadsafe function
-    /// over a no-op JS callback. The native `notify` watcher thread is
-    /// invisible to libuv, so without this a plain script like
-    /// `cache.startWatchingJs()` would exit the moment the script ends.
-    /// `stop_watching` / `dispose` / dropping the cache drop the handle,
-    /// which lets the process exit again.
-    watch_keep_alive: Option<KeepAlive>,
-    entry_dir: PathBuf,
-    assets_dir: Option<PathBuf>,
-    theme_path: PathBuf,
-    theme_config: BaganThemeConfig,
-    theme_assets_dir: PathBuf,
-    theme_layouts_dir: PathBuf,
-    theme_data_dir: PathBuf,
-    theme_includes_dir: PathBuf,
-    markdown_layouts: HashSet<String>,
-    change_callbacks: ChangeCallbacks,
-    /// Hosting/baseUrl configuration.
-    hosting: BaseDirInfo,
-    /// Build output directory (for `outFilePath` fields).
-    out_dir: String,
-    /// Liquid (`.html`) collections: tracked absolute files mapped to
-    /// their slug base directory (the collection root for directories,
-    /// the entry directory for single files). Clone-shared with the
-    /// watcher thread.
-    liquid_files: Arc<Mutex<HashMap<PathBuf, PathBuf>>>,
-    /// Configured liquid collection roots (the raw resolved
-    /// directories/files from `liquidCollections`), used to re-flatten
-    /// after directory-level events. Clone-shared with the watcher thread.
-    liquid_collection_roots: Arc<Mutex<Vec<PathBuf>>>,
-    /// JS-side `liquidRender(file)` callback for LiquidObject values
-    /// (npm builds hold a `FunctionRef` + the napi `Env` captured at
-    /// construction; rendering runs on the JS main thread only). The
-    /// callback returns the front-matter fields + rendered HTML.
-    liquid_renderer: Option<LiquidRenderer>,
-    /// The napi `Env` captured at construction, used to `borrow_back` the
-    /// `liquidRenderer` callback (npm builds only).
-    liquid_env: Option<Env>,
-}
-#[napi]
+
+#[cfg_attr(feature = "npm", napi)]
 impl BaganCache {
     /// JS: `new BaganCache(entryDir?, assetsDir?, options?)`.
     ///
@@ -520,11 +861,17 @@ impl BaganCache {
     /// export (`themeConfigObject`); the caller is expected to `require`
     /// (or import) the theme package and pass the export through. Register
     /// custom visitors and parser hooks afterwards with `usePlugin()`.
+    #[cfg(feature = "npm")]
     #[napi(constructor)]
-    pub fn new(env: Env, mut options: Option<BaganCacheOptions>) -> Result<Self> {
-        let mut config = BaganCacheOptions {
-            entry_dir: options.as_ref().and_then(|o| o.entry_dir.clone()),
-            assets_dir: options.as_ref().and_then(|o| o.assets_dir.clone()),
+    pub fn new(
+        env: Env,
+        entry_dir: Option<String>,
+        assets_dir: Option<String>,
+        options: Option<BaganCacheJsOptions>,
+    ) -> Result<Self> {
+        let mut config = BaganCacheConfig {
+            entry_dir,
+            assets_dir,
             theme: options.as_ref().and_then(|o| o.theme.clone()),
             theme_layouts_dir: options.as_ref().and_then(|o| o.theme_layouts_dir.clone()),
             theme_includes_dir: options.as_ref().and_then(|o| o.theme_includes_dir.clone()),
@@ -538,8 +885,14 @@ impl BaganCache {
             cache_dir: options.as_ref().and_then(|o| o.cache_dir.clone()),
             liquid_collections: options.as_ref().and_then(|o| o.liquid_collections.clone()),
             memory: None,
-            liquid_render: options.as_mut().and_then(|o| o.liquid_render.take()),
         };
+        // JS-side `liquidRender(file)` callback: received as a `Function`
+        // (napi objects cannot hold `FunctionRef` fields) and converted to
+        // a `FunctionRef` for later main-thread invocation.
+        let liquid_renderer: Option<LiquidRenderer> = options
+            .as_ref()
+            .and_then(|o| o.liquid_render.as_ref())
+            .and_then(|render| render.create_ref().ok());
         if let Some(theme_config) = options.as_ref().and_then(|o| o.theme_config.clone()) {
             config.theme_config = Some(theme_config);
         } else if let Some(theme_name) = config
@@ -559,14 +912,51 @@ impl BaganCache {
             let cwd = env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             config.theme_config = load_theme_config_from_module(&env, &cwd, theme_name)?;
         }
-        BaganCache::with_config(env, config)
+        BaganCache::with_config_liquid(config, liquid_renderer, Some(env))
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e}")))
     }
-    pub fn with_config(env: Env, config: BaganCacheOptions) -> Result<Self> {
-        Self::with_config_inner(env, config)
+
+    /// JS: `BaganCache.withConfigJs(config)` — full configuration form,
+    /// including memory-tier budgets. Liquid collections may be
+    /// configured through `liquidCollections`, but `liquidRender` is only
+    /// available on the constructor (the `withConfig` object cannot carry
+    /// functions across the boundary) — use `useLiquidRender()` to
+    /// register the callback afterwards.
+    #[cfg(feature = "npm")]
+    #[napi(factory)]
+    pub fn with_config_js(config: BaganCacheConfig) -> Result<Self> {
+        BaganCache::with_config(config)
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e}")))
     }
-    fn with_config_inner(env: Env, config: BaganCacheOptions) -> io::Result<Self> {
+
+    /// Construct a cache from a full configuration (Rust entry point).
+    ///
+    /// Construction loads all markdown (and optionally assets) into the
+    /// memory tier; disk writes happen later on the archive worker's
+    /// size/interval flush (or explicitly via [`Self::flush`]). Liquid
+    /// collections are resolved and loaded, but without a renderer the
+    /// front-matter fields come from the raw front matter and `html`
+    /// stays empty (Rust consumers can use [`Self::use_liquid_render`]).
+    pub fn with_config(config: BaganCacheConfig) -> io::Result<Self> {
+        #[cfg(feature = "npm")]
+        {
+            Self::with_config_liquid(config, None, None)
+        }
+        #[cfg(not(feature = "npm"))]
+        {
+            Self::with_config_liquid(config, None)
+        }
+    }
+
+    /// [`Self::with_config`] with an optional Liquid renderer: the JS
+    /// `liquidRender(file) => LiquidObject` callback (npm builds) or a
+    /// boxed Rust closure (non-npm builds), invoked when `LiquidObject`
+    /// values are built.
+    pub fn with_config_liquid(
+        config: BaganCacheConfig,
+        liquid_renderer: Option<LiquidRenderer>,
+        #[cfg(feature = "npm")] liquid_env: Option<Env>,
+    ) -> io::Result<Self> {
         let cwd = env::current_dir()?;
         // Resolve the entry dir to an absolute path first: watcher events
         // carry absolute paths, so the `is_markdown` prefix check needs an
@@ -840,6 +1230,7 @@ impl BaganCache {
             ast_opts,
             render_opts,
             watcher: None,
+            #[cfg(feature = "npm")]
             watch_keep_alive: None,
             entry_dir,
             assets_dir: resolved_assets,
@@ -855,15 +1246,26 @@ impl BaganCache {
             out_dir,
             liquid_files: Arc::new(Mutex::new(liquid_files)),
             liquid_collection_roots: Arc::new(Mutex::new(liquid_roots)),
-            liquid_renderer: config
-                .liquid_render
-                .and_then(|render| render.create_ref().ok()),
-            liquid_env: Some(env),
+            liquid_renderer,
+            #[cfg(feature = "npm")]
+            liquid_env,
+        })
+    }
+
+    /// Construct a [`BaganCache`] over `entry_dir` with the default
+    /// configuration — Rust convenience (generic signatures cannot cross
+    /// the NAPI boundary).
+    #[cfg(not(feature = "npm"))]
+    pub fn new<P: AsRef<Path>>(entry_dir: P) -> io::Result<Self> {
+        BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some(entry_dir.as_ref().to_string_lossy().to_string()),
+            ..Default::default()
         })
     }
 
     /// Register a JavaScript plugin applied to every page render
     /// (JS: `cache.usePlugin({ visitBlock, visitInline, parseBlock, parseInline })`).
+    #[cfg(feature = "npm")]
     #[napi]
     pub fn use_plugin(&mut self, env: Env, plugin: Plugin) {
         self.plugins.lock().unwrap().push(plugin.register(env));
@@ -882,6 +1284,7 @@ impl BaganCache {
     /// leaves the front-matter fields empty and `html` as the raw
     /// template. Also accepts the callback through the constructor
     /// option `liquidRender`.
+    #[cfg(feature = "npm")]
     #[napi]
     pub fn use_liquid_render(
         &mut self,
@@ -898,6 +1301,21 @@ impl BaganCache {
         self.liquid_env = Some(env);
         self.liquid_renderer = render.create_ref().ok();
     }
+
+    /// Register a Rust closure that renders Liquid collection files for
+    /// `liquids()` / `get_liquid()` (non-npm builds): it receives the
+    /// raw file text and returns the front-matter fields + rendered
+    /// HTML as a [`LiquidObject`]. `withConfig`
+    /// consumers cannot pass functions through the napi config object,
+    /// so this is the Rust counterpart of the constructor's
+    /// `liquidRender` option.
+    #[cfg(not(feature = "npm"))]
+    pub fn use_liquid_render<F>(&mut self, render: F)
+    where
+        F: Fn(String) -> LiquidObject + Send + Sync + 'static,
+    {
+        self.liquid_renderer = Some(Box::new(render));
+    }
     /// JS: `cache.startWatchingJs()` — start watching the entry (and
     /// assets) directories recursively; errors surface as JS exceptions.
     ///
@@ -906,9 +1324,10 @@ impl BaganCache {
     /// `startWatchingJs()` keeps running until `dispose()` (or process
     /// exit) stops the watcher. Without it, the native watcher thread is
     /// invisible to libuv and Node exits as soon as the script ends.
+    #[cfg(feature = "npm")]
     #[napi]
-    pub fn start_watching(&mut self, env: Env) -> Result<()> {
-        self.start_watching_local()
+    pub fn start_watching_js(&mut self, env: Env) -> Result<()> {
+        self.start_watching()
             .map_err(|e| napi::Error::new(napi::Status::GenericFailure, format!("{e}")))?;
         // Watcher started: take over the event loop. The no-op callback
         // keeps the (default strong) TSFN ref'd, which is the only thing
@@ -932,7 +1351,7 @@ impl BaganCache {
     ///
     /// The returned [`io::Result`] covers watcher setup errors only; runtime
     /// errors are printed to stderr by the watch callback.
-    pub fn start_watching_local(&mut self) -> io::Result<()> {
+    pub fn start_watching(&mut self) -> io::Result<()> {
         // The watcher thread shares the memory tier and archive handle
         // through clone-shared Arcs.
         let memory = self.memory.clone();
@@ -1170,6 +1589,7 @@ impl BaganCache {
         self.watcher = None;
         // Releasing the keep-alive lets a Node process that only watches
         // exit again (the strong TSFN was the last ref'd loop handle).
+        #[cfg(feature = "npm")]
         {
             self.watch_keep_alive = None;
         }
@@ -1214,7 +1634,7 @@ impl BaganCache {
 
     /// JS: `cache.getText(absPath)` — cached text of a file, or `null`.
     /// Reads fall through to the archive tier for evicted entries.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn get_text(&self, abs_path: String) -> Option<String> {
         self.get(Path::new(&abs_path)).and_then(|c| match c {
             CachedContent::Text(s) => Some(s),
@@ -1224,7 +1644,7 @@ impl BaganCache {
 
     /// JS: `cache.getBinary(absPath)` — cached bytes of a binary asset, or
     /// `null`. Reads fall through to the archive tier.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn get_binary(&self, abs_path: String) -> Option<Vec<u8>> {
         self.get(Path::new(&abs_path)).and_then(|c| match c {
             CachedContent::Binary(b) => Some(b),
@@ -1234,7 +1654,7 @@ impl BaganCache {
 
     /// JS: `cache.listFiles()` — absolute paths of everything cached
     /// (memory + archive tiers).
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn list_files(&self) -> Vec<String> {
         self.all_keys()
             .into_iter()
@@ -1244,7 +1664,7 @@ impl BaganCache {
 
     /// JS: `cache.markdownFiles()` — absolute paths of cached markdown
     /// files (either tier).
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn markdown_files(&self) -> Vec<String> {
         self.filter_cached_files(|ext| MARKDOWN_EXTENSIONS.contains(&ext))
     }
@@ -1253,7 +1673,7 @@ impl BaganCache {
     /// templates, sorted by name.
     ///
     /// JS: `cache.markdownLayouts()`.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn markdown_layouts(&self) -> Vec<String> {
         let mut layouts: Vec<String> = self.markdown_layouts.iter().cloned().collect();
         layouts.sort();
@@ -1262,7 +1682,7 @@ impl BaganCache {
 
     /// Absolute paths to the configured theme's layouts, assets, and data
     /// directories.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn theme_dirs(&self) -> ThemeDirs {
         let dirs = ThemeDirs {
             assets_dir: self.theme_assets_dir.to_string_lossy().to_string(),
@@ -1274,7 +1694,7 @@ impl BaganCache {
     }
     /// JS: `cache.assetFiles()` — absolute paths of cached non-markdown,
     /// non-liquid files (either tier).
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn asset_files(&self) -> Vec<String> {
         self.filter_cached_files(|ext| {
             !MARKDOWN_EXTENSIONS.contains(&ext) && !LIQUID_EXTENSIONS.contains(&ext)
@@ -1316,7 +1736,7 @@ impl BaganCache {
 
     /// JS: `cache.pages()` — every page object, for Liquid themes
     /// (`{{ page.title }}`, `{{ page.layout }}`, …).
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn pages(&self) -> Vec<PageObject> {
         self.page_objects()
     }
@@ -1365,7 +1785,7 @@ impl BaganCache {
 
     /// JS: `cache.getPage(inputPath)` — a single page object by absolute
     /// input path, or `null`.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn get_page(&self, input_path: String) -> Option<PageObject> {
         self.page_object_for(Path::new(&input_path))
     }
@@ -1393,7 +1813,7 @@ impl BaganCache {
     }
 
     /// JS: `cache.assets()` — every asset object.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn assets(&self) -> Vec<AssetsObject> {
         self.asset_objects()
     }
@@ -1433,7 +1853,7 @@ impl BaganCache {
 
     /// JS: `cache.getAsset(inputPath)` — a single asset object by absolute
     /// input path, or `null`.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn get_asset(&self, input_path: String) -> Option<AssetsObject> {
         self.asset_object_for(Path::new(&input_path))
     }
@@ -1455,7 +1875,7 @@ impl BaganCache {
     /// `liquidCollections`: front-matter fields from the JS-side
     /// `liquidRender(file)` callback (which also renders the HTML),
     /// path-derived fields from the cache.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn liquids(&self) -> Vec<LiquidObject> {
         self.liquid_objects()
     }
@@ -1561,14 +1981,14 @@ impl BaganCache {
 
     /// JS: `cache.getLiquid(inputPath)` — a single liquid object by
     /// absolute input path, or `null`.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn get_liquid(&self, input_path: String) -> Option<LiquidObject> {
         self.liquid_object_for(Path::new(&input_path))
     }
 
     /// JS: `cache.liquidFiles()` — absolute paths of the tracked liquid
     /// template files (either tier).
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn liquid_files(&self) -> Vec<String> {
         self.liquid_files
             .lock()
@@ -1584,6 +2004,7 @@ impl BaganCache {
     /// the raw front matter parsed by the cache).
     fn render_liquid(&self, raw: &str) -> Option<LiquidObject> {
         let renderer = &self.liquid_renderer;
+        #[cfg(feature = "npm")]
         {
             let renderer = renderer.as_ref()?;
             let env = self.liquid_env.as_ref()?;
@@ -1671,18 +2092,22 @@ impl BaganCache {
                 input_file_path: String::new(),
             })
         }
+        #[cfg(not(feature = "npm"))]
+        {
+            renderer.as_ref().map(|render| render(raw.to_string()))
+        }
     }
 
     /// Absolute path to the configured theme package — or, in local
     /// mode (no `theme` configured), the entry directory the local
     /// theme directories resolve from.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn theme_path(&self) -> String {
         self.theme_path.to_string_lossy().to_string()
     }
 
     /// Parsed theme metadata exposed as an object to Rust and JavaScript.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn theme_config(&self) -> BaganThemeConfig {
         self.theme_config.clone()
     }
@@ -1691,7 +2116,7 @@ impl BaganCache {
 
     /// JS: `cache.archived()` — absolute paths flushed to the disk
     /// archive. Everything not listed still lives in memory only.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn archived(&self) -> Vec<String> {
         self.archive
             .keys()
@@ -1702,14 +2127,14 @@ impl BaganCache {
 
     /// JS: `cache.mapJson()` — the current `map.json` document (path →
     /// shard location + metadata, including front matter for search).
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn map_json(&self) -> String {
         self.archive.map_json()
     }
 
     /// JS: `cache.flush()` — write all pending archive entries now,
     /// blocking until the worker is done.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn flush(&self) {
         self.archive.flush();
     }
@@ -1718,14 +2143,14 @@ impl BaganCache {
 
     /// JS: `cache.baseUrl()` — the resolved base URL path prefix for the
     /// configured hosting (e.g. `/repo/` for a GitHub Pages project site).
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn base_url(&self) -> String {
         self.hosting.base_url()
     }
 
     /// JS: `cache.resolveUrl(path)` — prefix a site-relative path with the
     /// resolved base URL: `resolveUrl("docs/intro")` → `/repo/docs/intro`.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn resolve_url(&self, path: String) -> String {
         let base = self.hosting.base_url();
         let path = path.trim_start_matches('/');
@@ -1738,7 +2163,7 @@ impl BaganCache {
 
     /// JS: `cache.siteUrl()` — absolute origin URL for canonical URLs, or
     /// `null` when not configured.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn site_url(&self) -> Option<String> {
         self.hosting.site_url()
     }
@@ -1751,6 +2176,7 @@ impl BaganCache {
     ///
     /// The callback is wrapped in a `ThreadsafeFunction` because notify
     /// events fire on the watcher thread, not the JS main thread.
+    #[cfg(feature = "npm")]
     #[napi]
     pub fn on_change(
         &self,
@@ -1778,8 +2204,19 @@ impl BaganCache {
             })))
     }
 
+    /// Register a Rust callback that receives every change detected while
+    /// watching is active. Returns a subscription id that can be passed to
+    /// [`BaganCache::off_change`].
+    #[cfg(not(feature = "npm"))]
+    pub fn on_change<F>(&self, callback: F) -> u32
+    where
+        F: Fn(CacheChangeEvent) + Send + 'static,
+    {
+        self.change_callbacks.add(Box::new(callback))
+    }
+
     /// JS: `cache.offChange(id)` — remove a previously registered callback.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn off_change(&self, id: u32) {
         self.change_callbacks.remove(id);
     }
@@ -1789,11 +2226,69 @@ impl BaganCache {
     ///
     /// Rust consumers do not need this: dropping the [`BaganCache`] stops
     /// the watcher, flushes the archive, and joins the workers.
-    #[napi]
+    #[cfg_attr(feature = "npm", napi)]
     pub fn dispose(&mut self) {
         self.stop_watching();
         self.change_callbacks.clear();
     }
+}
+
+/// JS-side options accepted by the `BaganCache` constructor (a flattened
+/// subset of [`BaganCacheConfig`]; memory budgets only apply through the
+/// `withConfig` factory).
+#[cfg(feature = "npm")]
+#[napi(object)]
+pub struct BaganCacheJsOptions {
+    /// Theme package name (Jekyll-gem style), resolved from
+    /// `node_modules/<theme>`. Omit (null/undefined) for a local site:
+    /// the theme directories below are then resolved from the entry
+    /// directory.
+    pub theme: Option<String>,
+    /// Local layouts directory (local mode only), relative to the entry
+    /// directory. Defaults to `_layouts`.
+    pub theme_layouts_dir: Option<String>,
+    /// Local includes directory (local mode only), relative to the entry
+    /// directory. Defaults to `_includes`.
+    pub theme_includes_dir: Option<String>,
+    /// Local theme assets directory (local mode only), relative to the
+    /// entry directory. Defaults to `_assets`.
+    pub theme_assets_dir: Option<String>,
+    /// Local data directory (local mode only), relative to the entry
+    /// directory. Defaults to `_data`.
+    pub theme_data_dir: Option<String>,
+    /// Theme configuration object (`themeConfigObject`). When omitted
+    /// (and `theme` is set) it is loaded automatically from the theme
+    /// package's default export.
+    pub theme_config: Option<BaganThemeConfig>,
+    /// Markdown parsing/rendering options (`fragment`, GFM, …).
+    pub markdown: Option<PeisarOptions>,
+    /// Disk-archive thresholds (shard size / flush interval).
+    pub archive: Option<ArchiveConfig>,
+    /// Static-hosting baseUrl resolution.
+    pub hosting: Option<HostingConfig>,
+    /// Build output directory.
+    pub out_dir: Option<String>,
+    /// Disk-archive directory.
+    pub cache_dir: Option<String>,
+    /// Liquid (`.html`) collections inside the entry directory: each
+    /// entry is a directory (flattened recursively) or a single file,
+    /// resolved against the entry directory. The discovered files are
+    /// cached as text, watched, and exposed through `cache.liquids()`.
+    pub liquid_collections: Option<Vec<String>>,
+    /// JavaScript function that renders a Liquid collection file to a
+    /// page (`liquidRender(file: string) => PageObject`). The
+    /// callback extracts the YAML front matter from the raw file,
+    /// renders the Liquid content to HTML, and returns the page fields
+    /// (the object is converted leniently — `html` is the meaningful
+    /// field, anything else falls back to the raw front matter); the
+    /// cache fills the path-derived fields (fileName, slug,
+    /// outFilePath, inputFilePath) and `raw`. Invoked on the JS main
+    /// thread when liquid objects are built; a callback that throws or
+    /// returns nothing leaves the front-matter fields empty and `html`
+    /// as the raw template. Registerable later with `useLiquidRender()`
+    /// as well.
+    #[napi(ts_type = "(file: string) => PageObject")]
+    pub liquid_render: Option<Function<'static, String, serde_json::Value>>,
 }
 
 // Dropping a `BaganCache` is the Rust equivalent of the JS `dispose()`:
@@ -1804,10 +2299,1247 @@ impl BaganCache {
 impl Drop for BaganCache {
     fn drop(&mut self) {
         self.watcher = None;
+        #[cfg(feature = "npm")]
         {
             self.watch_keep_alive = None;
         }
         self.change_callbacks.clear();
         self.archive.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::Write;
+
+    static TEST_CWD_LOCK: Mutex<()> = Mutex::new(());
+
+    fn make_tmp(tag: &str) -> io::Result<(PathBuf, PathBuf)> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| io::Error::other(format!("time error: {e}")))?
+            .as_nanos();
+        let tmp = env::temp_dir().join(format!("peisar_test_{tag}_{now}"));
+        if tmp.exists() {
+            fs::remove_dir_all(&tmp)?;
+        }
+        fs::create_dir_all(&tmp)?;
+        let local_theme = tmp.join("_layouts");
+        fs::create_dir_all(&local_theme)?;
+        for layout in ["default", "docs", "blog", "page", "home"] {
+            fs::write(local_theme.join(format!("{layout}.html")), "")?;
+        }
+        fs::write(local_theme.join("ignored.txt"), "")?;
+        let orig = env::current_dir()?;
+        Ok((tmp, orig))
+    }
+
+    fn write_md(dir: &Path, rel: &str, content: &str) {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = File::create(p).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    /// Write one (empty) layout template into `dir/_layouts`.
+    fn write_layout(dir: &Path, name: &str) {
+        let layouts = dir.join("_layouts");
+        fs::create_dir_all(&layouts).unwrap();
+        fs::write(layouts.join(format!("{name}.html")), "").unwrap();
+    }
+
+    fn restore(orig: PathBuf, tmp: PathBuf) {
+        let _ = env::set_current_dir(orig);
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn default_entry_and_layout_filter() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("layoutfilter")?;
+        env::set_current_dir(&tmp)?;
+        write_md(&tmp, "index.md", "---\nlayout: default\n---\n# Home\n");
+        write_md(&tmp, "docs/page.md", "---\nlayout: docs\n---\n# Docs\n");
+        write_md(&tmp, "blog/post.md", "---\nlayout: blog\n---\n# Blog\n");
+        write_md(&tmp, "custom.md", "---\nlayout: custom\n---\n# Custom\n");
+        write_md(&tmp, "missing-layout.md", "# No layout\n");
+        fs::write(tmp.join("_layouts").join("custom.html"), "")?;
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            ..Default::default()
+        })?;
+
+        assert_eq!(
+            cache.markdown_layouts(),
+            ["blog", "custom", "default", "docs", "home", "page"]
+        );
+        assert_eq!(cache.markdown_files().len(), 4);
+        assert!(
+            cache
+                .markdown_files()
+                .iter()
+                .any(|path| path.ends_with("custom.md"))
+        );
+        assert!(
+            !cache
+                .markdown_files()
+                .iter()
+                .any(|path| path.ends_with("missing-layout.md"))
+        );
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn local_theme_dirs_default_to_entry_dir() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("localdirs")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: home\n---\n# Home\n",
+        );
+        write_layout(&tmp.join("contents"), "home");
+        fs::create_dir_all(tmp.join("contents/_assets/css"))?;
+        fs::write(tmp.join("contents/_assets/css/site.css"), "body {}")?;
+        fs::create_dir_all(tmp.join("contents/_includes"))?;
+        fs::create_dir_all(tmp.join("contents/_data"))?;
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            ..Default::default()
+        })?;
+
+        // No theme configured: the theme dirs resolve from the entry dir.
+        assert_eq!(
+            cache.theme_path(),
+            tmp.join("contents").to_string_lossy().to_string()
+        );
+        let dirs = cache.theme_dirs();
+        assert_eq!(
+            dirs.layouts_dir,
+            tmp.join("contents/_layouts").to_string_lossy()
+        );
+        assert_eq!(
+            dirs.includes_dir,
+            tmp.join("contents/_includes").to_string_lossy()
+        );
+        assert_eq!(
+            dirs.assets_dir,
+            tmp.join("contents/_assets").to_string_lossy()
+        );
+        assert_eq!(dirs.data_dir, tmp.join("contents/_data").to_string_lossy());
+        assert_eq!(cache.pages().len(), 1);
+        let assets = cache.assets();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].slug, "/css/site.css");
+        assert_eq!(assets[0].raw, "body {}");
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn local_theme_dirs_can_be_overridden_in_config() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("localdirsconfig")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: main\n---\n# Home\n",
+        );
+        fs::create_dir_all(tmp.join("contents/templates"))?;
+        fs::write(tmp.join("contents/templates/main.html"), "")?;
+        fs::create_dir_all(tmp.join("contents/partial"))?;
+        fs::create_dir_all(tmp.join("contents/static/img"))?;
+        fs::write(tmp.join("contents/static/img/logo.png"), vec![1u8, 2])?;
+        fs::create_dir_all(tmp.join("contents/dataset"))?;
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            theme_layouts_dir: Some("templates".into()),
+            theme_includes_dir: Some("partial".into()),
+            theme_assets_dir: Some("static".into()),
+            theme_data_dir: Some("dataset".into()),
+            ..Default::default()
+        })?;
+
+        let dirs = cache.theme_dirs();
+        assert_eq!(
+            dirs.layouts_dir,
+            tmp.join("contents/templates").to_string_lossy()
+        );
+        assert_eq!(
+            dirs.includes_dir,
+            tmp.join("contents/partial").to_string_lossy()
+        );
+        assert_eq!(
+            dirs.assets_dir,
+            tmp.join("contents/static").to_string_lossy()
+        );
+        assert_eq!(
+            dirs.data_dir,
+            tmp.join("contents/dataset").to_string_lossy()
+        );
+        assert!(
+            cache
+                .markdown_layouts()
+                .iter()
+                .any(|layout| layout == "main")
+        );
+        assert_eq!(cache.assets().len(), 1);
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn theme_config_and_assets_are_loaded() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("theme")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: home\n---\n# Home\n",
+        );
+        let theme_dir = tmp.join("node_modules").join("custom-theme");
+        fs::create_dir_all(theme_dir.join("_assets/css"))?;
+        fs::create_dir_all(theme_dir.join("_layouts"))?;
+        fs::create_dir_all(theme_dir.join("_includes"))?;
+        fs::create_dir_all(theme_dir.join("_data"))?;
+        fs::write(theme_dir.join("_layouts/home.html"), "")?;
+        fs::write(
+            theme_dir.join("package.json"),
+            r#"{"name":"custom-theme","version":"2.0.0","main":"index.js"}"#,
+        )?;
+        fs::write(
+            theme_dir.join("index.js"),
+            "module.exports = { default: { name: 'custom-theme', version: '2.0.0' } };",
+        )?;
+        fs::write(theme_dir.join("_assets/css/theme.css"), "body {}")?;
+
+        // Rust entry point: pass the themeConfigObject explicitly (no JS
+        // runtime available to evaluate the package's default export).
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            theme: Some("custom-theme".into()),
+            theme_config: Some(BaganThemeConfig {
+                name: Some("custom-theme".into()),
+                version: Some("2.0.0".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })?;
+
+        let config = cache.theme_config();
+        assert_eq!(config.name.as_deref(), Some("custom-theme"));
+        assert_eq!(config.version.as_deref(), Some("2.0.0"));
+        assert_eq!(config.author, None);
+        assert_eq!(config.layouts_dir, None);
+        assert_eq!(config.includes_dir, None);
+        assert_eq!(config.assets_dir, None);
+        assert_eq!(config.data_dir, None);
+        assert_eq!(cache.theme_path(), theme_dir.to_string_lossy());
+        let dirs = cache.theme_dirs();
+        assert_eq!(
+            dirs.layouts_dir,
+            theme_dir.join("_layouts").to_string_lossy()
+        );
+        assert_eq!(dirs.assets_dir, theme_dir.join("_assets").to_string_lossy());
+        assert_eq!(cache.pages().len(), 1);
+        let assets = cache.assets();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].slug, "/css/theme.css");
+        assert_eq!(assets[0].raw, "body {}");
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn theme_config_without_js_falls_back_to_package_json() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("pkgfallback")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: home\n---\n# Home\n",
+        );
+        let theme_dir = tmp.join("node_modules").join("meta-theme");
+        fs::create_dir_all(theme_dir.join("_layouts"))?;
+        fs::write(theme_dir.join("_layouts/home.html"), "")?;
+        fs::write(
+            theme_dir.join("package.json"),
+            r#"{"name":"meta-theme","version":"3.1.4","author":{"name":"Bagan"}}"#,
+        )?;
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            theme: Some("meta-theme".into()),
+            ..Default::default()
+        })?;
+
+        let config = cache.theme_config();
+        assert_eq!(config.name.as_deref(), Some("meta-theme"));
+        assert_eq!(config.version.as_deref(), Some("3.1.4"));
+        assert_eq!(config.author.as_deref(), Some("Bagan"));
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn configured_layout_directory_drives_discovery() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("customlayoutdir")?;
+        env::set_current_dir(&tmp)?;
+        write_md(&tmp, "index.md", "---\nlayout: custom\n---\n# Custom\n");
+        let theme_dir = tmp.join("node_modules").join("custom-theme");
+        fs::create_dir_all(theme_dir.join("templates"))?;
+        fs::write(
+            theme_dir.join("package.json"),
+            r#"{"name":"custom-theme","version":"1.0.0"}"#,
+        )?;
+        fs::write(theme_dir.join("templates/custom.html"), "")?;
+        fs::write(theme_dir.join("templates/ignored.txt"), "")?;
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            theme: Some("custom-theme".into()),
+            theme_config: Some(BaganThemeConfig {
+                layouts_dir: Some("templates".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })?;
+
+        assert!(
+            cache
+                .markdown_layouts()
+                .iter()
+                .any(|layout| layout == "custom")
+        );
+        assert_eq!(cache.markdown_files().len(), 1);
+        assert_eq!(cache.page_objects().len(), 1);
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn theme_without_html_layouts_rejects_markdown_pages() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("emptylayouts")?;
+        env::set_current_dir(&tmp)?;
+        let theme_layouts_dir = tmp.join("_layouts");
+        fs::remove_dir_all(&theme_layouts_dir)?;
+        fs::create_dir_all(&theme_layouts_dir)?;
+        write_md(&tmp, "index.md", "---\nlayout: default\n---\n# Home\n");
+
+        let cache = BaganCache::new(&tmp)?;
+
+        assert!(cache.markdown_layouts().is_empty());
+        assert!(cache.markdown_files().is_empty());
+        assert!(cache.page_objects().is_empty());
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_theme_is_an_error() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("missingtheme")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+
+        let error = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            theme: Some("missing-theme".into()),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => return Err(io::Error::other("missing theme unexpectedly succeeded")),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("theme package"));
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_index_is_an_error() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("missingindex")?;
+        env::set_current_dir(&tmp)?;
+        fs::create_dir("contents")?;
+
+        let error = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => return Err(io::Error::other("missing index unexpectedly succeeded")),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("index"));
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn assets_must_exist_inside_entry_directory() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("assetvalidation")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+        fs::create_dir_all("contents/assets")?;
+        fs::create_dir("outside")?;
+
+        let missing = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            assets_dir: Some("contents/missing".into()),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => return Err(io::Error::other("missing assets unexpectedly succeeded")),
+        };
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+
+        let outside = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            assets_dir: Some("outside".into()),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => return Err(io::Error::other("outside assets unexpectedly succeeded")),
+        };
+        assert_eq!(outside.kind(), io::ErrorKind::InvalidInput);
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_front_matter_is_a_collection_error() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("invalidfrontmatter")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+        write_md(
+            &tmp,
+            "contents/broken.md",
+            "---\nlayout: [\n---\n# Broken\n",
+        );
+
+        let error = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "invalid front matter unexpectedly succeeded",
+                ));
+            }
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[cfg(not(feature = "npm"))]
+    #[test]
+    fn on_change_registers_a_rust_callback() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("change")?;
+        env::set_current_dir(&tmp)?;
+        write_md(&tmp, "index.md", "---\nlayout: default\n---\n# Home\n");
+
+        let cache = BaganCache::new(&tmp)?;
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_callback = Arc::clone(&received);
+        let subscription = cache.on_change(move |event| {
+            received_callback.lock().unwrap().push(event);
+        });
+
+        cache.change_callbacks.dispatch(CacheChangeEvent {
+            path: "/tmp/example.md".to_string(),
+            kind: "modify".to_string(),
+            is_markdown: true,
+        });
+        cache.off_change(subscription);
+
+        assert_eq!(received.lock().unwrap().len(), 1);
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn initial_snapshot_flushes_without_waiting_for_interval() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("memfirst")?;
+        env::set_current_dir(&tmp)?;
+        write_md(&tmp, "docs/index.md", "---\nlayout: default\n---\n# Home\n");
+        write_md(
+            &tmp,
+            "docs/doc1.md",
+            "---\ntitle: Test\nlayout: default\n---\n# Hello\n",
+        );
+        write_layout(&tmp.join("docs"), "default");
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("docs".into()),
+            archive: Some(ArchiveConfig {
+                flush_interval_ms: Some(60_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })?;
+
+        // Memory tier has the content immediately.
+        let all = cache.all();
+        assert_eq!(all.len(), 2);
+        let content = cache.get(&tmp.join("docs").join("doc1.md")).unwrap();
+        assert!(matches!(content, CachedContent::Text(ref s) if s.contains("# Hello")));
+
+        let archive_dir = tmp.join(DEFAULT_ARCHIVE_DIR_NAME);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while cache.archived().len() != 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(cache.archived().len(), 2);
+        assert!(archive_dir.join("map.json").exists());
+
+        drop(cache);
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn flush_writes_map_and_shards() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("flush")?;
+        env::set_current_dir(&tmp)?;
+        write_md(&tmp, "docs/index.md", "---\nlayout: default\n---\n# Home\n");
+        write_md(&tmp, "docs/a.md", "---\nlayout: default\n---\n# A\n");
+        write_layout(&tmp.join("docs"), "default");
+
+        let cache = BaganCache::new("docs")?;
+        cache.flush();
+
+        let archive_dir = tmp.join(DEFAULT_ARCHIVE_DIR_NAME);
+        let map_str = fs::read_to_string(archive_dir.join("map.json"))?;
+        let map: serde_json::Value = serde_json::from_str(&map_str).unwrap();
+        assert_eq!(map["version"], 1);
+        assert_eq!(
+            map["files"]["docs/a.md"]["frontmatter"]["layout"],
+            "default"
+        );
+
+        assert_eq!(cache.archived().len(), 2);
+        assert!(archive_dir.join("shard-000001.bin").exists());
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn page_objects_liquid_shape() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("pages")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\ntitle: Home Page\nlayout: custom\nsummary: hi there\ntags:\n  - a\n  - b\ndate: 2026-01-01\nauthor: someone\n---\n# Not the title\n\nBody\n",
+        );
+        write_md(
+            &tmp,
+            "contents/docs/intro.md",
+            "---\nlayout: docs\n---\n# Intro\n",
+        );
+        write_md(&tmp, "outside.md", "---\nlayout: custom\n---\n# Outside\n");
+        write_layout(&tmp.join("contents"), "custom");
+        write_layout(&tmp.join("contents"), "docs");
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            markdown: Some(PeisarOptions {
+                fragment: Some(true),
+                ..Default::default()
+            }),
+            hosting: Some(HostingConfig {
+                provider: Some(HostingProvider::GithubPages),
+                repo: Some("my-repo".into()),
+                ..Default::default()
+            }),
+            out_dir: Some("dist".into()),
+            ..Default::default()
+        })?;
+
+        let pages = cache.page_objects();
+        assert_eq!(pages.len(), 2);
+        assert!(
+            pages
+                .iter()
+                .all(|page| !page.input_file_path.ends_with("outside.md"))
+        );
+
+        let home = pages
+            .iter()
+            .find(|p| p.input_file_path.ends_with("index.md"))
+            .unwrap();
+        assert_eq!(home.layout, "custom");
+        assert_eq!(home.title.as_deref(), Some("Home Page"));
+        assert_eq!(home.summary.as_deref(), Some("hi there"));
+        assert_eq!(home.tags, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(home.publish_date.as_deref(), Some("2026-01-01"));
+        // extra fields are flattened and stringified
+        assert_eq!(home.extra.as_ref().unwrap()["author"], "someone");
+        // baseUrl applied
+        assert_eq!(home.slug, "/my-repo/");
+        assert_eq!(home.out_file_path, "dist/index.html");
+        assert!(home.html.contains("Body"));
+
+        let intro = pages
+            .iter()
+            .find(|p| p.input_file_path.ends_with("intro.md"))
+            .unwrap();
+        // Title falls back to the first heading
+        assert_eq!(intro.title.as_deref(), Some("Intro"));
+        assert_eq!(intro.slug, "/my-repo/docs/intro");
+        assert_eq!(intro.out_file_path, "dist/docs/intro/index.html");
+        assert_eq!(intro.layout, "docs");
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn asset_objects_shape() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("assets")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+        fs::create_dir_all(tmp.join("contents/public").join("img"))?;
+        fs::write(
+            tmp.join("contents/public").join("img").join("logo.png"),
+            vec![1u8, 2, 3],
+        )?;
+        write_layout(&tmp.join("contents"), "default");
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            assets_dir: Some("contents/public".into()),
+            ..Default::default()
+        })?;
+
+        let assets = cache.asset_objects();
+        assert_eq!(assets.len(), 1);
+        let logo = &assets[0];
+        assert_eq!(logo.file_name, "logo");
+        assert_eq!(logo.ext, "png");
+        assert_eq!(logo.file_type, "Image");
+        assert_eq!(logo.slug, "/img/logo.png");
+        // DEFAULT_OUT_DIR is ".bagan" when outDir is not configured.
+        assert_eq!(logo.out_file_path, ".bagan/img/logo.png");
+        // binary raw is base64
+        assert_eq!(logo.raw, binary_to_base64(&[1u8, 2, 3]));
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn liquid_collections_flatten_and_render() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("liquid")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+        write_layout(&tmp.join("contents"), "default");
+        // Collection directory with nested liquid files + a single file.
+        // Liquid files carry YAML front matter like markdown pages.
+        fs::create_dir_all(tmp.join("contents/_pages/docs"))?;
+        fs::write(
+            tmp.join("contents/_pages/about.html"),
+            "---\nlayout: page\ntitle: About Page\ntags:\n  - one\n  - two\ncustom: x\n---\n<h1>About {{ site }}</h1>\n",
+        )?;
+        fs::write(tmp.join("contents/_pages/docs/guide.html"), "<p>Guide</p>")?;
+        fs::write(tmp.join("contents/contact.liquid"), "<p>Contact</p>")?;
+
+        let mut cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["_pages".into(), "contact.liquid".into()]),
+            ..Default::default()
+        })?;
+        // Rust-side renderer (JS consumers pass `liquidRender` instead):
+        // extracts the front matter, renders the content, and returns
+        // the front-matter fields.
+        #[cfg(not(feature = "npm"))]
+        cache.use_liquid_render(|file: String| {
+            let parsed = frontmatter(file.clone())
+                .ok()
+                .and_then(|p| p.yaml_data().cloned());
+            LiquidObject {
+                layout: fm_string(parsed.as_ref(), &["layout"])
+                    .unwrap_or_else(|| "default".to_string()),
+                title: fm_string(parsed.as_ref(), &["title"]),
+                summary: fm_string(parsed.as_ref(), &["summary", "description"]),
+                tags: fm_string_list(parsed.as_ref(), "tags"),
+                publish_date: fm_string(parsed.as_ref(), &["date", "publishDate", "publish_date"]),
+                extra: parsed.as_ref().and_then(extra_frontmatter_fields),
+                html: file.replace("{{ site }}", "Bagan"),
+                file_name: String::new(),
+                slug: String::new(),
+                raw: String::new(),
+                out_file_path: String::new(),
+                input_file_path: String::new(),
+            }
+        });
+
+        // Directories are flattened and merged with configured files.
+        let files = cache.liquid_files();
+        assert_eq!(files.len(), 3);
+        let liquids = cache.liquid_objects();
+        assert_eq!(liquids.len(), 3);
+
+        let about = liquids
+            .iter()
+            .find(|l| l.input_file_path.ends_with("about.html"))
+            .unwrap();
+        assert_eq!(about.file_name, "about");
+        assert_eq!(about.slug, "/about");
+        assert_eq!(about.out_file_path, ".bagan/about.html");
+        assert!(about.raw.contains("layout: page"));
+        // Front-matter fields share the PageObject shape.
+        #[cfg(not(feature = "npm"))]
+        {
+            assert_eq!(about.layout, "page");
+            assert_eq!(about.title.as_deref(), Some("About Page"));
+            assert_eq!(about.tags, Some(vec!["one".to_string(), "two".to_string()]));
+            assert_eq!(about.extra.as_ref().unwrap()["custom"], "x");
+            assert_eq!(
+                about.html,
+                "---\nlayout: page\ntitle: About Page\ntags:\n  - one\n  - two\ncustom: x\n---\n<h1>About Bagan</h1>\n"
+            );
+        }
+        // Without a renderer (npm test runs): the cache still parses the
+        // raw front matter, but html stays empty.
+        #[cfg(feature = "npm")]
+        {
+            assert_eq!(about.layout, "page");
+            assert_eq!(about.title.as_deref(), Some("About Page"));
+            assert!(about.html.is_empty());
+        }
+
+        let guide = liquids
+            .iter()
+            .find(|l| l.input_file_path.ends_with("guide.html"))
+            .unwrap();
+        assert_eq!(guide.slug, "/docs/guide");
+        assert_eq!(guide.out_file_path, ".bagan/docs/guide.html");
+        // No front matter → layout falls back to "default".
+        assert_eq!(guide.layout, "default");
+
+        let contact = liquids
+            .iter()
+            .find(|l| l.input_file_path.ends_with("contact.liquid"))
+            .unwrap();
+        assert_eq!(contact.slug, "/contact");
+        assert_eq!(contact.out_file_path, ".bagan/contact.html");
+
+        // Liquid files are cached (either tier) and stay out of
+        // `assets()`/`assetFiles()`.
+        assert_eq!(cache.asset_objects().len(), 0);
+        assert!(
+            !cache
+                .asset_files()
+                .iter()
+                .any(|p| p.ends_with("about.html"))
+        );
+        // Without a renderer the front-matter fields come from the raw
+        // front matter and html stays empty.
+        let bare = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["_pages".into(), "contact.liquid".into()]),
+            ..Default::default()
+        })?;
+        let bare_about = bare
+            .liquid_objects()
+            .into_iter()
+            .find(|l| l.input_file_path.ends_with("about.html"))
+            .unwrap();
+        assert!(bare_about.html.is_empty());
+        assert_eq!(bare_about.layout, "page");
+        assert_eq!(bare_about.title.as_deref(), Some("About Page"));
+        assert_eq!(
+            bare_about.tags,
+            Some(vec!["one".to_string(), "two".to_string()])
+        );
+        assert_eq!(bare_about.extra.as_ref().unwrap()["custom"], "x");
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn liquid_collections_must_live_inside_entry_dir() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("liquidoutside")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+        write_layout(&tmp.join("contents"), "default");
+        fs::create_dir("outside")?;
+        fs::write("outside/evil.html", "<p>no</p>")?;
+
+        // Outside the entry directory → InvalidInput.
+        let outside = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["../outside".into()]),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "outside liquid collection unexpectedly succeeded",
+                ));
+            }
+        };
+        assert_eq!(outside.kind(), io::ErrorKind::InvalidInput);
+
+        // Missing collection → NotFound.
+        let missing = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["_missing".into()]),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "missing liquid collection unexpectedly succeeded",
+                ));
+            }
+        };
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+
+        // A non-liquid file inside the entry dir → InvalidInput.
+        fs::write("contents/notes.txt", "plain")?;
+        let non_liquid = match BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["notes.txt".into()]),
+            ..Default::default()
+        }) {
+            Err(error) => error,
+            Ok(_) => {
+                return Err(io::Error::other(
+                    "non-liquid collection unexpectedly succeeded",
+                ));
+            }
+        };
+        assert_eq!(non_liquid.kind(), io::ErrorKind::InvalidInput);
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn watcher_tracks_new_and_removed_liquid_files() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("liquidwatch")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+        write_layout(&tmp.join("contents"), "default");
+        fs::create_dir_all(tmp.join("contents/_pages"))?;
+        fs::write(tmp.join("contents/_pages/a.html"), "<p>A</p>")?;
+
+        let mut cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            liquid_collections: Some(vec!["_pages".into()]),
+            ..Default::default()
+        })?;
+        cache.start_watching()?;
+        assert_eq!(cache.liquid_files().len(), 1);
+
+        // Create a new liquid file inside the collection.
+        let new_path = tmp.join("contents/_pages/b.html");
+        fs::write(&new_path, "<p>B</p>")?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if cache.liquid_files().iter().any(|p| p.ends_with("b.html")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(cache.liquid_files().iter().any(|p| p.ends_with("b.html")));
+        assert!(cache.get(&new_path).is_some());
+
+        // Remove it again.
+        fs::remove_file(&new_path)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if !cache.liquid_files().iter().any(|p| p.ends_with("b.html")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !cache.liquid_files().iter().any(|p| p.ends_with("b.html")),
+            "removed liquid file remained tracked"
+        );
+        assert!(cache.get(&new_path).is_none());
+
+        cache.stop_watching();
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn lru_eviction_falls_through_to_archive() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("evict")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "docs/index.md",
+            "---\nlayout: default\n---\n# Small\n",
+        );
+        write_md(
+            &tmp,
+            "docs/big.md",
+            "---\nlayout: default\n---\n# Big\nBody padding to exceed the budget.\n",
+        );
+        write_layout(&tmp.join("docs"), "default");
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("docs".into()),
+            memory: Some(MemoryConfig {
+                byte_budget: Some(10),
+                entry_budget: None,
+            }),
+            // Tiny thresholds so the flush happens quickly.
+            archive: Some(ArchiveConfig {
+                shard_bytes: Some(1),
+                flush_interval_ms: Some(100),
+            }),
+            ..Default::default()
+        })?;
+        cache.flush();
+
+        // The LRU evicted entries, but they are still readable (archive).
+        let files = cache.markdown_files();
+        assert_eq!(files.len(), 2, "both files still resolvable");
+        for f in &files {
+            assert!(cache.get_text(f.clone()).is_some(), "{} readable", f);
+        }
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_url_uses_hosting_config() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("resolve")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "contents/index.md",
+            "---\nlayout: default\n---\n# Home\n",
+        );
+        write_layout(&tmp.join("contents"), "default");
+
+        let cache = BaganCache::with_config(BaganCacheConfig {
+            entry_dir: Some("contents".into()),
+            hosting: Some(HostingConfig {
+                provider: Some(HostingProvider::GithubPages),
+                repo: Some("my-repo".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })?;
+        assert_eq!(cache.base_url(), "/my-repo/");
+        assert_eq!(
+            cache.resolve_url("docs/intro".into()),
+            "/my-repo/docs/intro"
+        );
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn gitignore_entry_not_duplicated() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("gitignore")?;
+        env::set_current_dir(&tmp)?;
+        fs::write(".gitignore", format!("{DEFAULT_ARCHIVE_DIR_NAME}\n"))?;
+        write_md(&tmp, "docs/index.md", "---\nlayout: default\n---\n# Home\n");
+        write_md(&tmp, "docs/doc2.md", "# No frontmatter\nContent\n");
+        write_layout(&tmp.join("docs"), "default");
+
+        let _cache = BaganCache::new("docs")?;
+
+        let git = fs::read_to_string(".gitignore")?;
+        let cache_dir_occurrences = git
+            .lines()
+            .filter(|l| l.trim() == DEFAULT_ARCHIVE_DIR_NAME)
+            .count();
+        let out_dir_occurrences = git.lines().filter(|l| l.trim() == DEFAULT_OUT_DIR).count();
+        assert_eq!(cache_dir_occurrences, 1);
+        assert_eq!(out_dir_occurrences, 1);
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn map_json_contains_frontmatter() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("mapjson")?;
+        env::set_current_dir(&tmp)?;
+        write_md(&tmp, "docs/index.md", "---\nlayout: default\n---\n# Home\n");
+        write_md(
+            &tmp,
+            "docs/tagged.md",
+            "---\ntitle: Tagged\nlayout: default\ntags:\n  - x\n---\n# Tagged\n",
+        );
+        write_layout(&tmp.join("docs"), "default");
+
+        let cache = BaganCache::new("docs")?;
+        cache.flush();
+
+        let map: serde_json::Value = serde_json::from_str(&cache.map_json()).unwrap();
+        let entry = &map["files"]["docs/tagged.md"];
+        assert_eq!(entry["frontmatter"]["title"], "Tagged");
+        assert_eq!(entry["frontmatter"]["tags"][0], "x");
+        assert_eq!(entry["kind"], "text");
+        assert!(entry["hash"].as_str().unwrap().len() == 64);
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn pretty_path_renders_relative_to_root() {
+        let root = Path::new("/project");
+        assert_eq!(
+            pretty_path(Path::new("/project/contents/docs/a.md"), root),
+            "contents/docs/a.md"
+        );
+        // Root-level paths render as their bare name.
+        assert_eq!(
+            pretty_path(Path::new("/project/README.md"), root),
+            "README.md"
+        );
+        // Paths outside the root fall back to the absolute path.
+        assert_eq!(
+            pretty_path(Path::new("/elsewhere/b.png"), root),
+            "/elsewhere/b.png"
+        );
+    }
+
+    #[test]
+    fn format_change_line_matches_kind_and_relative_path() {
+        let root = Path::new("/project");
+        let abs = root.join("contents").join("a.md");
+        assert_eq!(
+            format_change_line("create", &abs, root, false),
+            "created contents/a.md"
+        );
+        assert_eq!(
+            format_change_line("modify", &abs, root, false),
+            "modified contents/a.md"
+        );
+        assert_eq!(
+            format_change_line("remove", &abs, root, false),
+            "removed contents/a.md"
+        );
+        assert_eq!(
+            format_change_line("other", &abs, root, false),
+            "changed contents/a.md"
+        );
+        // Colors wrap the label only; the path stays plain.
+        let colored = format_change_line("modify", &abs, root, true);
+        assert_eq!(
+            colored,
+            format!("{LOG_STYLE_YELLOW}modified{LOG_STYLE_RESET} contents/a.md")
+        );
+        // Paths outside the root fall back to the absolute path.
+        let outside = Path::new("/elsewhere/b.png");
+        assert_eq!(
+            format_change_line("create", outside, root, false),
+            "created /elsewhere/b.png"
+        );
+    }
+
+    #[test]
+    fn classify_change_uses_filesystem_state() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("classify")?;
+        env::set_current_dir(&tmp)?;
+        write_md(
+            &tmp,
+            "docs/index.md",
+            "---\nlayout: default\n---\n# Known\n",
+        );
+        write_layout(&tmp.join("docs"), "default");
+
+        let cache = BaganCache::new("docs")?;
+
+        // Exists + known to the cache → modify.
+        assert_eq!(
+            classify_change(
+                &cache.memory,
+                &cache.archive,
+                &tmp.join("docs").join("index.md")
+            ),
+            "modify"
+        );
+        // Exists + unknown → create.
+        write_md(&tmp, "docs/fresh.md", "# Fresh\n");
+        assert_eq!(
+            classify_change(
+                &cache.memory,
+                &cache.archive,
+                &tmp.join("docs").join("fresh.md")
+            ),
+            "create"
+        );
+        // Gone → remove (even though never cached).
+        assert_eq!(
+            classify_change(
+                &cache.memory,
+                &cache.archive,
+                &tmp.join("docs").join("ghost.md")
+            ),
+            "remove"
+        );
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn should_log_change_one_line_per_operation() {
+        let now = Instant::now();
+        let p = Path::new("/project/contents/a.md");
+        let mut last: HashMap<PathBuf, Instant> = HashMap::new();
+
+        // Untracked extensions (editor side files) never log.
+        let tmp = Path::new("/project/contents/a.md.tmp");
+        assert!(!should_log_change(tmp, &last, now));
+        // A trackable path with no recent line logs; the duplicate
+        // events of one operation (create/remove/modify within the
+        // window) do not log again.
+        assert!(should_log_change(p, &last, now));
+        last.insert(p.to_path_buf(), now);
+        assert!(!should_log_change(p, &last, now));
+        // A second operation 2 s later is a new save — log it.
+        let later = now + Duration::from_secs(2);
+        assert!(should_log_change(p, &last, later));
+    }
+
+    #[test]
+    fn log_trackable_matches_cache_admission() {
+        // Markdown and asset extensions log; editor side files never.
+        assert!(log_trackable(Path::new("a/hi.md")));
+        assert!(log_trackable(Path::new("a/hi.markdown")));
+        assert!(log_trackable(Path::new("a/logo.png")));
+        assert!(log_trackable(Path::new("a/style.css")));
+        assert!(!log_trackable(Path::new("a/hi.md.tmp")));
+        assert!(!log_trackable(Path::new("a/hi.tmp")));
+        assert!(!log_trackable(Path::new("a/.hi.md.swp")));
+        assert!(!log_trackable(Path::new("a/hi")));
+    }
+
+    #[test]
+    fn stop_watching_is_safe_without_starting() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("stopwatch")?;
+        env::set_current_dir(&tmp)?;
+        write_md(&tmp, "docs/index.md", "---\nlayout: default\n---\n# A\n");
+        write_layout(&tmp.join("docs"), "default");
+
+        let mut cache = BaganCache::new("docs")?;
+        // Stop without start, then stop twice — all must be no-ops.
+        cache.stop_watching();
+        cache.start_watching()?;
+        cache.stop_watching();
+        cache.stop_watching();
+        // The watcher is gone: the entry stayed in memory throughout.
+        assert!(cache.get(&tmp.join("docs").join("index.md")).is_some());
+
+        restore(orig, tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn watcher_removes_deleted_files_from_cache() -> io::Result<()> {
+        let _guard = TEST_CWD_LOCK.lock().unwrap();
+        let (tmp, orig) = make_tmp("watchremove")?;
+        env::set_current_dir(&tmp)?;
+        write_md(&tmp, "docs/index.md", "---\nlayout: default\n---\n# Home\n");
+        write_md(&tmp, "docs/a.md", "---\nlayout: default\n---\n# A\n");
+        write_layout(&tmp.join("docs"), "default");
+
+        let mut cache = BaganCache::new("docs")?;
+        let path = tmp.join("docs/a.md");
+        cache.start_watching()?;
+        fs::remove_file(&path)?;
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            if cache.get(&path).is_none() {
+                cache.stop_watching();
+                restore(orig, tmp);
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        cache.stop_watching();
+        restore(orig, tmp);
+        Err(io::Error::other("deleted file remained in the cache"))
     }
 }

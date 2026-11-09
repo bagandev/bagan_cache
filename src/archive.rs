@@ -25,10 +25,10 @@
 //! are atomic (temp file + rename), so a crash never leaves a torn shard
 //! behind.
 
+use super::CachedContent;
 use super::def::{DEFAULT_ARCHIVE_DIR_NAME, DEFAULT_OUT_DIR};
 use super::lru::content_size_of;
 use super::obj_cache::rel_to_base;
-use super::utils::CachedContent;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -560,4 +560,194 @@ pub(crate) fn ensure_gitignore_entry(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration as D;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "peisar_archive_{tag}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn upsert_flush_and_read_back() {
+        let cwd = tmp_dir("roundtrip");
+        let mut archive = ArchiveHandle::new(cwd.clone(), 1024, D::from_millis(60_000), None);
+        let md = cwd.join("docs").join("page.md");
+        archive.upsert(
+            md.clone(),
+            CachedContent::Text("---\ntitle: Hello\n---\n\n# Hello\n".to_string()),
+        );
+        archive.flush();
+
+        assert!(archive.contains(&md));
+        match archive.read(&md) {
+            Some(CachedContent::Text(text)) => assert!(text.contains("# Hello")),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // map.json on disk, keyed by the relative path, with front matter.
+        let map = fs::read_to_string(cwd.join(DEFAULT_ARCHIVE_DIR_NAME).join("map.json")).unwrap();
+        let map: Value = serde_json::from_str(&map).unwrap();
+        assert_eq!(map["version"], 1);
+        let entry = &map["files"]["docs/page.md"];
+        assert_eq!(entry["kind"], "text");
+        assert_eq!(entry["frontmatter"]["title"], "Hello");
+        assert!(entry["hash"].as_str().unwrap().len() == 64);
+
+        archive.close();
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn binary_entries_roundtrip() {
+        let cwd = tmp_dir("binary");
+        let mut archive = ArchiveHandle::new(cwd.clone(), 0, D::from_millis(60_000), None);
+        let png = cwd.join("logo.png");
+        let bytes = vec![1u8, 2, 3, 4];
+        archive.upsert(png.clone(), CachedContent::Binary(bytes.clone()));
+        archive.flush();
+        match archive.read(&png) {
+            Some(CachedContent::Binary(b)) => assert_eq!(b, bytes),
+            other => panic!("expected binary, got {other:?}"),
+        }
+        archive.close();
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn remove_drops_entry_and_gc_collects_orphan_shard() {
+        let cwd = tmp_dir("remove");
+        let mut archive = ArchiveHandle::new(cwd.clone(), 0, D::from_millis(60_000), None);
+        let a = cwd.join("a.md");
+        archive.upsert(a.clone(), CachedContent::Text("A".to_string()));
+        archive.flush();
+        assert!(archive.contains(&a));
+
+        archive.remove(a.clone());
+        archive.flush();
+        assert!(!archive.contains(&a));
+        assert!(archive.read(&a).is_none());
+
+        // map.json no longer references the file.
+        let map = fs::read_to_string(cwd.join(DEFAULT_ARCHIVE_DIR_NAME).join("map.json")).unwrap();
+        let map: Value = serde_json::from_str(&map).unwrap();
+        assert!(map["files"].get("a.md").is_none());
+
+        // The shard that held only `a` is garbage-collected.
+        let shards: Vec<_> = fs::read_dir(cwd.join(DEFAULT_ARCHIVE_DIR_NAME))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("shard-") && n.ends_with(".bin")
+            })
+            .collect();
+        assert!(shards.is_empty(), "orphan shards should be GC'd");
+
+        archive.close();
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn sync_all_replaces_everything() {
+        let cwd = tmp_dir("sync");
+        let mut archive = ArchiveHandle::new(cwd.clone(), 0, D::from_millis(60_000), None);
+        archive.upsert(cwd.join("old.md"), CachedContent::Text("old".to_string()));
+        archive.flush();
+        assert!(archive.entry_count() == 1);
+
+        let mut fresh = HashMap::new();
+        fresh.insert(cwd.join("new.md"), CachedContent::Text("new".to_string()));
+        archive.sync_all(fresh);
+        archive.flush();
+        assert!(!archive.contains(&cwd.join("old.md")));
+        assert!(archive.contains(&cwd.join("new.md")));
+
+        archive.close();
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn interval_flushes_without_size_threshold() {
+        let cwd = tmp_dir("interval");
+        // Zero shard threshold → only the interval flushes.
+        let mut archive = ArchiveHandle::new(cwd.clone(), 0, D::from_millis(50), None);
+        archive.upsert(cwd.join("lazy.md"), CachedContent::Text("lazy".to_string()));
+        // Not flushed yet.
+        assert!(!archive.contains(&cwd.join("lazy.md")));
+        // Wait past the interval.
+        thread::sleep(D::from_millis(250));
+        assert!(archive.contains(&cwd.join("lazy.md")));
+
+        archive.close();
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn drop_flushes_pending_entries() {
+        let cwd = tmp_dir("drop");
+        let md = cwd.join("gone.md");
+        {
+            let archive = ArchiveHandle::new(cwd.clone(), 0, D::from_millis(60_000), None);
+            archive.upsert(md.clone(), CachedContent::Text("bye".to_string()));
+            // no explicit flush; Drop must persist it
+        }
+        let map = fs::read_to_string(cwd.join(DEFAULT_ARCHIVE_DIR_NAME).join("map.json")).unwrap();
+        assert!(map.contains("gone.md"));
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn gitignore_entry_added_once() {
+        let cwd = tmp_dir("gitignore");
+        fs::write(cwd.join(".gitignore"), "target\n").unwrap();
+        ensure_gitignore_entry(
+            &cwd,
+            Some(DEFAULT_ARCHIVE_DIR_NAME.to_string()),
+            Some(DEFAULT_OUT_DIR.to_string()),
+        )
+        .unwrap();
+        ensure_gitignore_entry(
+            &cwd,
+            Some(DEFAULT_ARCHIVE_DIR_NAME.to_string()),
+            Some(DEFAULT_OUT_DIR.to_string()),
+        )
+        .unwrap();
+        let git = fs::read_to_string(cwd.join(".gitignore")).unwrap();
+        assert_eq!(
+            git.lines()
+                .filter(|l| l.trim() == DEFAULT_ARCHIVE_DIR_NAME)
+                .count(),
+            1
+        );
+
+        // missing file is created
+        let fresh = tmp_dir("gitignore_fresh");
+        ensure_gitignore_entry(
+            &fresh,
+            Some(DEFAULT_ARCHIVE_DIR_NAME.to_string()),
+            Some(DEFAULT_OUT_DIR.to_string()),
+        )
+        .unwrap();
+        let git = fs::read_to_string(fresh.join(".gitignore")).unwrap();
+        assert_eq!(
+            git,
+            format!("{DEFAULT_ARCHIVE_DIR_NAME}\n{DEFAULT_OUT_DIR}\n")
+        );
+        let _ = fs::remove_dir_all(&cwd);
+        let _ = fs::remove_dir_all(&fresh);
+    }
 }

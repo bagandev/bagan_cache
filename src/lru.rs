@@ -14,7 +14,7 @@
 //! slug, …) are derived on demand from these entries and cached separately
 //! in [`super::obj_cache`].
 
-use super::utils::CachedContent;
+use super::CachedContent;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -234,5 +234,114 @@ pub fn content_size_of(content: &CachedContent) -> u64 {
     match content {
         CachedContent::Text(s) => s.len() as u64,
         CachedContent::Binary(b) => b.len() as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn text(s: &str) -> CachedContent {
+        CachedContent::Text(s.to_string())
+    }
+
+    #[test]
+    fn evicts_least_recently_used_when_over_byte_budget() {
+        let cache = LruCache::new(10, 0);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_hook = Arc::clone(&seen);
+        cache.on_evict(move |p| seen_hook.lock().unwrap().push(p));
+
+        let a = PathBuf::from("/a.md"); // 4 bytes
+        let b = PathBuf::from("/b.md"); // 6 bytes
+        cache.insert(a.clone(), text("aaaa"));
+        cache.insert(b.clone(), text("bbbbbb"));
+        assert_eq!(cache.size_bytes(), 10);
+
+        // Touch `a` so `b` becomes the LRU victim: with an 8-byte `c`
+        // coming in (total 18), `b` (6 bytes) is evicted first (12
+        // remaining), then `a` (4 bytes, stamp 2) still puts us at 8 —
+        // both go, in recency order.
+        cache.get(&a);
+        cache.insert(PathBuf::from("/c.md"), text("cccccccc")); // 8 bytes
+        assert_eq!(cache.size_bytes(), 8);
+        assert!(cache.get(&b).is_none(), "b was the LRU victim");
+        assert!(cache.get(&a).is_none(), "a was evicted second");
+        assert!(cache.get(Path::new("/c.md")).is_some());
+
+        let evicted = seen.lock().unwrap();
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(evicted[0], PathBuf::from("/b.md"));
+        assert_eq!(evicted[1], PathBuf::from("/a.md"));
+    }
+
+    #[test]
+    fn evicts_by_entry_budget() {
+        let cache = LruCache::new(0, 2);
+        cache.insert(PathBuf::from("/1.md"), text("one"));
+        cache.insert(PathBuf::from("/2.md"), text("two"));
+        cache.insert(PathBuf::from("/3.md"), text("three"));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(Path::new("/1.md")).is_none());
+        assert!(cache.get(Path::new("/2.md")).is_some());
+        assert_eq!(cache.evicted_count(), 1);
+    }
+
+    #[test]
+    fn replace_all_resets_state() {
+        let cache = LruCache::new(0, 3);
+        cache.insert(PathBuf::from("/x.md"), text("xxxx"));
+        let mut fresh = HashMap::new();
+        fresh.insert(PathBuf::from("/y.md"), text("yy"));
+        cache.replace_all(fresh);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(Path::new("/x.md")).is_none());
+        assert_eq!(cache.size_bytes(), 2);
+    }
+
+    #[test]
+    fn unlimited_budgets_keep_everything() {
+        let cache = LruCache::new(0, 0);
+        for i in 0..50 {
+            cache.insert(PathBuf::from(format!("/f{i}.md")), text("x"));
+        }
+        assert_eq!(cache.len(), 50);
+        assert_eq!(cache.evicted_count(), 0);
+    }
+
+    #[test]
+    fn insert_cold_is_evicted_before_warm_entries() {
+        let cache = LruCache::new(0, 2);
+        cache.insert_cold(PathBuf::from("/cold.md"), text("c"));
+        cache.insert(PathBuf::from("/warm.md"), text("w"));
+        // The cold entry has stamp 0, the warm one 1 → inserting a third
+        // evicts the cold one.
+        cache.insert(PathBuf::from("/new.md"), text("n"));
+        assert!(cache.get(Path::new("/cold.md")).is_none());
+        assert!(cache.get(Path::new("/warm.md")).is_some());
+    }
+
+    #[test]
+    fn remove_does_not_fire_eviction_hook() {
+        let cache = LruCache::new(10, 0);
+        let evictions = Arc::new(Mutex::new(0u32));
+        let evictions_hook = Arc::clone(&evictions);
+        cache.on_evict(move |_| {
+            *evictions_hook.lock().unwrap() += 1;
+        });
+        cache.insert(PathBuf::from("/a.md"), text("aaaa"));
+        assert!(cache.remove(Path::new("/a.md")).is_some());
+        assert_eq!(*evictions.lock().unwrap(), 0);
+        assert_eq!(cache.evicted_count(), 0);
+    }
+
+    #[test]
+    fn insert_replaces_previous_size_accounting() {
+        let cache = LruCache::new(100, 0);
+        cache.insert(PathBuf::from("/a.md"), text("short"));
+        cache.insert(PathBuf::from("/a.md"), text("a much longer value"));
+        assert_eq!(cache.size_bytes(), "a much longer value".len() as u64);
+        assert_eq!(cache.len(), 1);
     }
 }

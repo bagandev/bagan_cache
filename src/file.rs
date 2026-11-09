@@ -143,3 +143,47 @@ pub fn collect_liquid_files<P: AsRef<Path>>(dir: P) -> Vec<PathBuf> {
 
     liquid_files
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn liquid_extension_detection() {
+        assert!(has_liquid_extension(Path::new("a/page.html")));
+        assert!(has_liquid_extension(Path::new("a/page.HTML")));
+        assert!(has_liquid_extension(Path::new("a/page.liquid")));
+        assert!(has_liquid_extension(Path::new("a/page.LIQUID.html")));
+        assert!(has_liquid_extension(Path::new("a/page.liquid.html")));
+        assert!(!has_liquid_extension(Path::new("a/page.md")));
+        assert!(!has_liquid_extension(Path::new("a/page.css")));
+        assert!(!has_liquid_extension(Path::new("a/.html.swp")));
+    }
+
+    #[test]
+    fn collect_liquid_files_flattens_recursively() {
+        let tmp = env::temp_dir().join(format!(
+            "bagan_liquid_{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        fs::create_dir_all(tmp.join("nested/deep")).unwrap();
+        fs::write(tmp.join("top.html"), "<p>top</p>").unwrap();
+        fs::write(tmp.join("nested/mid.liquid"), "<p>mid</p>").unwrap();
+        fs::write(tmp.join("nested/deep/bottom.liquid.html"), "<p>b</p>").unwrap();
+        fs::write(tmp.join("nested/deep/ignored.txt"), "plain").unwrap();
+
+        let files = collect_liquid_files(&tmp);
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().any(|p| p.ends_with("top.html")));
+        assert!(files.iter().any(|p| p.ends_with("mid.liquid")));
+        assert!(files.iter().any(|p| p.ends_with("bottom.liquid.html")));
+        assert!(!files.iter().any(|p| p.ends_with("ignored.txt")));
+
+        // Missing directories yield an empty vector.
+        assert!(collect_liquid_files(tmp.join("missing")).is_empty());
+
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+}

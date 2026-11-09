@@ -1,8 +1,34 @@
+//! Static-hosting `baseUrl` resolution for GitHub Pages, Vercel, Netlify,
+//! Cloudflare Pages, and plain self-hosted sites.
+//!
+//! Static site hosts differ in where a site ends up:
+//!
+//! | Host                          | Path prefix            |
+//! |-------------------------------|------------------------|
+//! | GitHub Pages *project* site   | `/<repo>`              |
+//! | GitHub Pages *user* site      | `/`                    |
+//! | Vercel / Netlify / Cloudflare | `/`                    |
+//! | Self-hosted subpath deploy    | whatever you configure |
+//!
+//! [`BaseDirInfo`] resolves the site configuration once and derives the
+//! `base_url` every URL and asset link should be prefixed with:
+//!
+//! ```rust
+//! use bagan_cache::{BaseDirInfo, HostingProvider};
+//!
+//! let info = BaseDirInfo::new(HostingProvider::GithubPages, None, None);
+//! assert_eq!(info.base_url(), "/");
+//!
+//! let project = BaseDirInfo::new(HostingProvider::GithubPages, Some("my-repo".into()), None);
+//! assert_eq!(project.base_url(), "/my-repo/");
+//! ```
+
+#[cfg(feature = "npm")]
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 
 /// Static site hosting providers with known `baseUrl` behavior.
-#[napi(string_enum, skip_typescript)]
+#[cfg_attr(feature = "npm", napi(string_enum, skip_typescript))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HostingProvider {
@@ -22,12 +48,12 @@ pub enum HostingProvider {
 
 /// Resolved hosting configuration: the single source of truth for every
 /// URL the pipeline emits (page slugs, asset links, absolute URLs).
-#[napi(object)]
+#[cfg_attr(feature = "npm", napi(object))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaseDirInfo {
     /// Hosting provider in effect.
-    #[napi(ts_type = "BaganHostingProvider")]
+    #[cfg_attr(feature = "npm", napi(ts_type = "BaganHostingProvider"))]
     pub provider: HostingProvider,
     /// Repository name (GitHub Pages project sites): `/<repo>/` prefix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,5 +185,84 @@ impl BaseDirInfo {
             HostingProvider::Custom
         };
         Self::new(provider, None, Some(url.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_pages_user_site_serves_at_root() {
+        let info = BaseDirInfo::new(
+            HostingProvider::GithubPages,
+            Some("user.github.io".into()),
+            None,
+        );
+        assert_eq!(info.base_url(), "/");
+        assert_eq!(info.site_url().unwrap(), "https://user.github.io");
+    }
+
+    #[test]
+    fn github_pages_project_site_uses_repo_prefix() {
+        let info = BaseDirInfo::new(HostingProvider::GithubPages, Some("my-repo".into()), None);
+        assert_eq!(info.base_url(), "/my-repo/");
+        assert_eq!(info.site_url(), None);
+    }
+
+    #[test]
+    fn platform_hosts_serve_at_root() {
+        for p in [
+            HostingProvider::Vercel,
+            HostingProvider::Netlify,
+            HostingProvider::CloudflarePages,
+        ] {
+            let info = BaseDirInfo::new(p, Some("ignored-repo".into()), None);
+            assert_eq!(info.base_url(), "/", "{:?} serves at root", p);
+        }
+    }
+
+    #[test]
+    fn custom_uses_configured_prefix() {
+        let mut info = BaseDirInfo::new(HostingProvider::Custom, None, None);
+        info.path_prefix = Some("subpath".into());
+        assert_eq!(info.base_url(), "/subpath/");
+    }
+
+    #[test]
+    fn absolute_urls_compose() {
+        let info = BaseDirInfo::new(HostingProvider::GithubPages, Some("my-repo".into()), None);
+        // No explicit site URL → origin unknown, still produce the path.
+        assert_eq!(info.absolute_url("docs/intro"), "/my-repo/docs/intro");
+
+        let with_origin = BaseDirInfo::new(
+            HostingProvider::Custom,
+            None,
+            Some("https://example.com/".into()),
+        );
+        assert_eq!(with_origin.site_url().unwrap(), "https://example.com");
+        assert_eq!(
+            with_origin.absolute_url("docs/intro"),
+            "https://example.com/docs/intro"
+        );
+    }
+
+    #[test]
+    fn detection_from_urls() {
+        let gh = BaseDirInfo::detect("https://user.github.io/my-repo/");
+        assert_eq!(gh.provider, HostingProvider::GithubPages);
+        assert_eq!(gh.repo.as_deref(), Some("my-repo"));
+
+        let vercel = BaseDirInfo::detect("https://demo.vercel.app");
+        assert_eq!(vercel.provider, HostingProvider::Vercel);
+
+        let netlify = BaseDirInfo::detect("https://wonderful.netlify.app/");
+        assert_eq!(netlify.provider, HostingProvider::Netlify);
+
+        let cf = BaseDirInfo::detect("https://abc.pages.dev");
+        assert_eq!(cf.provider, HostingProvider::CloudflarePages);
+
+        let custom = BaseDirInfo::detect("https://example.com/blog/");
+        assert_eq!(custom.provider, HostingProvider::Custom);
     }
 }

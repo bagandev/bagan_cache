@@ -1,7 +1,7 @@
 {
   "name": "@bagandev/bagan_cache",
   "version": "0.2.1",
-  "gitHead": "36c226c6c90db604022acf96487812f90a0da01c",
+  "gitHead": "0bff5136d6d1a7f04415d7adabcadeafc842a407",
   "description": "Run the filesystem watcher from the project root with:",
   "keywords": [],
   "homepage": "https://github.com/bagandev/bagan_cache#readme",
@@ -39,8 +39,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "bash scripts/build.sh",
-    "build:local": "bash scripts/local_build.sh"
+    "build": "bash scripts/build.sh"
   },
   "devDependencies": {
     "@emnapi/core": "^2.0.0-alpha.5",
