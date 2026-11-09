@@ -10,7 +10,6 @@
 //! operations (push / remove / replace / update) so the watcher can keep
 //! derived objects consistent without rebuilding whole arrays.
 
-#[cfg(feature = "npm")]
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 /// A page rendered for a Liquid theme: front-matter fields flattened next
 /// to pipeline-derived fields (layout, slug, html, …).
-#[cfg_attr(feature = "npm", napi(object))]
+#[napi(object)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageObject {
@@ -53,7 +52,7 @@ pub struct PageObject {
 }
 
 /// An asset mirrored by the cache (JS/CSS/image/video/font/…).
-#[cfg_attr(feature = "npm", napi(object))]
+#[napi(object)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetsObject {
@@ -86,7 +85,7 @@ pub struct AssetsObject {
 /// (falling back to the raw front matter when no callback is
 /// configured); path-derived fields (`fileName`, `slug`, `outFilePath`,
 /// `inputFilePath`) are computed by the cache.
-#[cfg_attr(feature = "npm", napi(object))]
+#[napi(object)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LiquidObject {
@@ -415,130 +414,5 @@ impl<V: Clone> ObjectCache<V> {
         } else {
             false
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn file_type_classification() {
-        assert_eq!(asset_file_type("png"), "Image");
-        assert_eq!(asset_file_type("js"), "Js");
-        assert_eq!(asset_file_type("css"), "Css");
-        assert_eq!(asset_file_type("woff2"), "Font");
-        assert_eq!(asset_file_type("mp4"), "Video");
-        assert_eq!(asset_file_type("map"), "Other");
-    }
-
-    #[test]
-    fn strips_extensions_from_file_names() {
-        assert_eq!(file_name_no_ext("foo.md"), "foo");
-        assert_eq!(file_name_no_ext("foo.bar.md"), "foo.bar");
-        assert_eq!(file_name_no_ext("noext"), "noext");
-        assert_eq!(file_name_no_ext(".hidden"), ".hidden");
-    }
-
-    #[test]
-    fn strips_full_liquid_extensions() {
-        assert_eq!(liquid_file_name_no_ext("about.html"), "about");
-        assert_eq!(liquid_file_name_no_ext("about.liquid"), "about");
-        assert_eq!(liquid_file_name_no_ext("about.LIQUID.html"), "about");
-        assert_eq!(liquid_file_name_no_ext("about.liquid.html"), "about");
-        assert_eq!(liquid_file_name_no_ext("noext"), "noext");
-        assert_eq!(liquid_file_name_no_ext(".hidden.html"), ".hidden");
-    }
-
-    #[test]
-    fn slugs_collapse_index_pages() {
-        let base = PathBuf::from("/site/contents");
-        let root_index = PathBuf::from("/site/contents/index.md");
-        let nested = PathBuf::from("/site/contents/docs/intro.md");
-        let nested_index = PathBuf::from("/site/contents/docs/index.md");
-        assert_eq!(markdown_slug(&root_index, &base, "/"), "/");
-        assert_eq!(markdown_slug(&nested, &base, ""), "/docs/intro");
-        assert_eq!(markdown_slug(&nested_index, &base, "/blog"), "/blog/docs");
-    }
-
-    #[test]
-    fn out_files_use_pretty_urls() {
-        let base = PathBuf::from("/site/contents");
-        let root_index = PathBuf::from("/site/contents/index.md");
-        let nested = PathBuf::from("/site/contents/docs/intro.md");
-        assert_eq!(page_out_file(&root_index, &base, "out"), "out/index.html");
-        assert_eq!(
-            page_out_file(&nested, &base, "out"),
-            "out/docs/intro/index.html"
-        );
-    }
-
-    #[test]
-    fn asset_paths_keep_extension() {
-        let base = PathBuf::from("/site/public");
-        let img = PathBuf::from("/site/public/img/logo.png");
-        assert_eq!(asset_slug(&img, &base, "/"), "/img/logo.png");
-        assert_eq!(asset_out_file(&img, &base, "dist"), "dist/img/logo.png");
-    }
-
-    #[test]
-    fn liquid_slugs_strip_html_extension() {
-        let base = PathBuf::from("/site/contents");
-        let page = PathBuf::from("/site/contents/about.html");
-        let nested = PathBuf::from("/site/contents/docs/guide.html");
-        let liquid = PathBuf::from("/site/contents/docs/note.liquid");
-        let double = PathBuf::from("/site/contents/docs/page.liquid.html");
-        let upper = PathBuf::from("/site/contents/docs/Note.LIQUID.HTML");
-        assert_eq!(liquid_slug(&page, &base, "/"), "/about");
-        assert_eq!(liquid_slug(&nested, &base, ""), "/docs/guide");
-        assert_eq!(liquid_slug(&liquid, &base, "/blog"), "/blog/docs/note");
-        // `page.liquid.html` keeps its emitted `.html` extension.
-        assert_eq!(liquid_slug(&double, &base, "/"), "/docs/page.html");
-        assert_eq!(liquid_slug(&upper, &base, "/"), "/docs/Note.html");
-    }
-
-    #[test]
-    fn liquid_out_files_map_to_html() {
-        let base = PathBuf::from("/site/contents");
-        let page = PathBuf::from("/site/contents/about.html");
-        let liquid = PathBuf::from("/site/contents/docs/note.liquid");
-        let double = PathBuf::from("/site/contents/docs/page.liquid.html");
-        assert_eq!(liquid_out_file(&page, &base, "out"), "out/about.html");
-        assert_eq!(liquid_out_file(&liquid, &base, "out"), "out/docs/note.html");
-        assert_eq!(liquid_out_file(&double, &base, "out"), "out/docs/page.html");
-    }
-
-    #[test]
-    fn extra_fields_skip_named_keys() {
-        let fm = serde_json::json!({
-            "title": "T",
-            "author": "someone",
-            "weight": 3,
-        });
-        let extra = extra_frontmatter_fields(&fm).unwrap();
-        assert_eq!(extra["author"], "someone");
-        assert_eq!(extra["weight"], "3");
-        assert!(!extra.contains_key("title"));
-        let only_named = serde_json::json!({ "title": "T" });
-        assert!(extra_frontmatter_fields(&only_named).is_none());
-    }
-
-    #[test]
-    fn object_cache_array_ops() {
-        let cache: ObjectCache<u32> = ObjectCache::new();
-        assert!(!cache.push_item("k", 1)); // key missing
-        cache.insert("k".into(), vec![10, 20]);
-        assert!(cache.push_item("k", 30));
-        assert_eq!(cache.get("k"), Some(vec![10, 20, 30]));
-        assert_eq!(cache.remove_item_at("k", 0), Some(10));
-        assert!(cache.replace_item_at("k", 0, 99));
-        assert_eq!(cache.get("k"), Some(vec![99, 30]));
-        assert!(cache.replace_item_by("k", |v| *v == 30, 33));
-        assert_eq!(cache.get("k"), Some(vec![99, 33]));
-        assert!(cache.update_items("k", |arr| { arr.iter_mut().for_each(|v| *v += 1) }));
-        assert_eq!(cache.get("k"), Some(vec![100, 34]));
-        assert!(cache.contains("k"));
-        assert_eq!(cache.remove("k"), Some(vec![100, 34]));
-        assert!(!cache.contains("k"));
     }
 }

@@ -3,9 +3,12 @@
         "autolinks",
         "Bagan",
         "bagandev",
+        "cdylib",
         "mdwn",
         "mkdn",
         "napi",
+        "rlib",
         "serde"
-    ]
+    ],
+    "rust-analyzer.cargo.target": "wasm32-unknown-unknown"
 }

@@ -28,7 +28,7 @@ sleep 3
 
 
 # 2. Build to build dir
-npx napi build --platform --features npm --js index.cjs --config-path napi.config.json
+npx napi build --platform --js index.cjs --config-path napi.config.json
 
 
 

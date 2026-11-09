@@ -1,4 +1,3 @@
-#[cfg(feature = "npm")]
 use napi_derive::napi;
 
 /// Theme configuration.
@@ -8,7 +7,7 @@ use napi_derive::napi;
 /// is the source of truth, `bagan-theme.json` is no longer read). In
 /// local mode (no `theme` configured) the values come from the cache
 /// configuration instead.
-#[cfg_attr(feature = "npm", napi(object))]
+#[napi(object)]
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaganThemeConfig {
@@ -70,7 +69,7 @@ impl BaganThemeConfig {
     }
 }
 
-#[cfg_attr(feature = "npm", napi(object))]
+#[napi(object)]
 #[derive(Debug, Clone, Default)]
 /// Resolved theme directories, as absolute paths.
 pub struct ThemeDirs {
