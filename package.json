@@ -1,6 +1,6 @@
 {
   "name": "@bagandev/bagan_cache",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "gitHead": "0bff5136d6d1a7f04415d7adabcadeafc842a407",
   "description": "Run the filesystem watcher from the project root with:",
   "keywords": [],
